@@ -1,0 +1,31 @@
+# ── 大件：一律不入库 ─────────────────────────────────────────────
+# 第三方框架 + 134 GB 权重。改动以 code/diffsynth_h3_action.patch 的形式提交，
+# 复现方式见 README「复现」一节。
+DiffSynth-Studio-h3/
+
+# 视频切片 38.5 GB + metadata（最大单文件 34 MB）。由 code/abot/build_abot_clips.py 生成。
+data/
+
+# 训练产出：latent 缓存 68 GB、LoRA checkpoint、推理视频
+output/
+
+# 原始 bundle 解压件，只读留档
+bundle/
+
+# 环境与运行时缓存（HF / torch / triton / inductor 等，全部钉在 nvme）
+.cache/
+logs/
+
+# ── 常规 ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+*.tmp
+*.tmp.*
+*.rej
+*.orig
+.DS_Store
+
+# 可视化页是生成物（内嵌视频，6 MB）。要入库就把下面这行注释掉。
+# docs/action_prompt_viz.html
