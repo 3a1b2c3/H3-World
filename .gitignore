@@ -20,6 +20,11 @@ logs/
 # 第一节，代码本身没有复现价值，留在本地备查即可。
 code/abot/legacy/
 
+# Demo 视频不入库：GitHub 的 user-attachments 直接托管并渲染成播放器，
+# README 里放裸 URL 即可。放进仓库既撑大历史，又只能渲染成一个链接。
+# 重新生成：python3 code/abot/build_demo_video.py --out demo.mp4
+docs/assets/
+
 # ── 常规 ─────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]

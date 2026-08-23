@@ -12,14 +12,13 @@ model was already pretrained on, and bound to the right frame by an attention ma
 
 ## 🎬 Demo
 
-[![demo reel](docs/assets/demo_poster.jpg)](docs/assets/demo.mp4)
+https://github.com/user-attachments/assets/fa6e5961-7ed6-4263-ad04-71c4c9953851
 
-**[▶ Watch the 40 s reel](docs/assets/demo.mp4)** — three chapters, each with the
-driving action prompt on screen:
+Three chapters, each with the driving action prompt on screen:
 
-1. **Generated vs ground truth** — the clip's own recorded keys
-2. **Same first frame, four action prompts** — identical seed and scene, only the keys differ
-3. **Longer videos** — one-shot 10.1 s and chunked 15.5 s
+1. **Generated vs ground truth** — three held-out clips, each driven by its own recorded keys
+2. **Same first frame, eight action prompts** — identical seed and scene, only the keys differ
+3. **Longer videos** — one-shot 10.1 s and chunked 15.5 s, with the chunk seams marked
 
 ## 📋 Contents
 
@@ -201,7 +200,8 @@ recovering the moment inference exits.
 ### Rebuild the demo reel and review pages
 
 ```bash
-python3 code/abot/build_demo_video.py      --out docs/assets/demo.mp4
+python3 code/abot/build_demo_video.py      --out demo.mp4   # then drag it into a
+                                                           # GitHub comment box to host it
 python3 code/abot/build_text_infer_viz.py  --runs output/abot_inference/step9840_text_gpu*
 python3 code/abot/build_action_ab_viz.py   --tag ab8_step9840
 python3 code/abot/check_page_js.py docs/<page>.html   # run the script under a fake DOM
