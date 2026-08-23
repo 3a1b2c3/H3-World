@@ -93,8 +93,10 @@ td.num{font-family:var(--mono);font-size:12.5px;font-variant-numeric:tabular-num
   <p class="eyebrow">MiniMax-H3 · ABot 世界模型</p>
   <h1>动作文本注入架构</h1>
   <p class="lede">按键怎么变成模型能听懂的条件，条件又怎么绑到具体那一帧上。
-  三张图：<b>数据怎么流</b>、<b>序列长什么样、掩码卡在哪</b>、
-  <b>这次和前两次失败的方案差在哪</b>。数字全部取自真实缓存条目，不是示意。</p>
+  六张图：<b>数据怎么流</b>、<b>序列长什么样、掩码卡在哪</b>、
+  <b>这次和前两次失败的方案差在哪</b>，以及四个容易看不明白的地方 ——
+  <b>124 帧怎么变成 37 个 latent</b>、<b>130×17 是什么</b>、
+  <b>每句标注占几行</b>、<b>390 行怎么来的</b>。数字全部取自真实缓存条目，不是示意。</p>
   <div class="stats">
     <div class="stat"><b>0</b><span>条件通路新增参数</span></div>
     <div class="stat"><b>9</b><span>位按键</span></div>
@@ -341,7 +343,163 @@ bias 和 FiLM 一个加性一个乘性、机制完全不同，却给出同一个
 而且不需要模型从零学一套新参数。</figcaption>
 </figure>
 
-<h2>四、训练时到底训了什么</h2>
+<h2>四、四个容易看不明白的地方</h2>
+
+<h3>① 124 帧怎么变成 37 个 latent</h3>
+<p class="sub">不是均匀切的。H3 的时间压缩有个<b>周期为 5 的不均匀分组</b>：
+每 5 个 latent 是一组，组内第一个只覆盖 <b>1 帧</b>，后四个各覆盖 <b>4 帧</b> ——
+一组合计 <code>1+4+4+4+4 = 17</code> 帧。</p>
+
+<figure>
+<svg viewBox="0 0 1000 210" role="img" aria-label="124 帧分成 37 个 latent 的示意：每 5 个 latent 一组覆盖 17 帧，组内第一个覆盖 1 帧、后四个各覆盖 4 帧；7 个完整组覆盖 119 帧，末尾余下 2 个 latent 覆盖 5 帧">
+  <g font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">
+    <text x="20" y="26" font-size="12" font-weight="600" fill="var(--ink)">一组 = 5 个 latent = 17 帧</text>
+
+    <rect x="20"  y="40" width="34"  height="30" rx="4" fill="var(--c-ann)" opacity=".9"/>
+    <text x="37"  y="60" text-anchor="middle" font-size="10.5" fill="#fff">L0</text>
+    <rect x="58"  y="40" width="122" height="30" rx="4" fill="var(--c-ann)" opacity=".55"/>
+    <text x="119" y="60" text-anchor="middle" font-size="10.5" fill="#fff">L1</text>
+    <rect x="184" y="40" width="122" height="30" rx="4" fill="var(--c-ann)" opacity=".55"/>
+    <text x="245" y="60" text-anchor="middle" font-size="10.5" fill="#fff">L2</text>
+    <rect x="310" y="40" width="122" height="30" rx="4" fill="var(--c-ann)" opacity=".55"/>
+    <text x="371" y="60" text-anchor="middle" font-size="10.5" fill="#fff">L3</text>
+    <rect x="436" y="40" width="122" height="30" rx="4" fill="var(--c-ann)" opacity=".55"/>
+    <text x="497" y="60" text-anchor="middle" font-size="10.5" fill="#fff">L4</text>
+
+    <text x="37"  y="86" text-anchor="middle" font-size="10" opacity=".7">1 帧</text>
+    <text x="119" y="86" text-anchor="middle" font-size="10" opacity=".7">4 帧</text>
+    <text x="245" y="86" text-anchor="middle" font-size="10" opacity=".7">4 帧</text>
+    <text x="371" y="86" text-anchor="middle" font-size="10" opacity=".7">4 帧</text>
+    <text x="497" y="86" text-anchor="middle" font-size="10" opacity=".7">4 帧</text>
+
+    <line x1="20" y1="96" x2="558" y2="96" stroke="currentColor" stroke-width="1" opacity=".4"/>
+    <text x="289" y="112" text-anchor="middle" font-size="11" fill="var(--accent)">帧 0 → 16（共 17 帧）</text>
+
+    <text x="620" y="26" font-size="12" font-weight="600" fill="var(--ink)">整条 124 帧</text>
+    <text x="620" y="50" font-size="11">7 组完整 = 35 个 latent = 119 帧</text>
+    <text x="620" y="70" font-size="11">余 2 个 latent（1 帧 + 4 帧）= 5 帧</text>
+    <line x1="620" y1="80" x2="950" y2="80" stroke="currentColor" stroke-width="1" opacity=".4"/>
+    <text x="620" y="98" font-size="11.5" fill="var(--accent)" font-weight="600">37 个 latent · 124 帧</text>
+    <text x="620" y="120" font-size="10.5" opacity=".7">latent_t = ((124−5) ÷ 17) × 5 + 2</text>
+    <text x="620" y="137" font-size="10.5" opacity=".7">= 7 × 5 + 2 = 37</text>
+
+    <text x="20" y="150" font-size="11.5" font-weight="600" fill="var(--ink)">所以帧数必须是 17k + 5</text>
+    <text x="20" y="170" font-size="10.5" opacity=".75">124 = 17×7+5（5.2s）· 243 = 17×14+5（10.1s）· 481 = 17×28+5（20.0s）</text>
+    <text x="20" y="190" font-size="10.5" opacity=".75">不是这个形状，最后一组凑不满，动作分箱会错位 —— 代码里直接拒绝。</text>
+  </g>
+</svg>
+<figcaption><b>实测的前 8 个 latent 覆盖区间：</b>
+<span class="t-mono">(0,1) (1,5) (5,9) (9,13) (13,17) (17,18) (18,22) (22,26)</span> ——
+可以看到 latent 0 和 latent 5 都只吃 1 帧，正好是每组的开头。
+这个不均匀性有个副作用：<b>只覆盖 1 帧的 latent 天生噪声更大</b>，
+早期规则表就在这里栽过 —— 相机通道逐帧求和，1 帧的 bin 只有 4 帧 bin 的四分之一，
+被误判成"相机变慢了"，22% 的步中招。修法是先除以 bin 帧数换算成逐帧速率再判档。</figcaption>
+</figure>
+
+<h3>② 按键矩阵 130 × 17 是什么</h3>
+<div class="scroll"><table>
+  <thead><tr><th>维度</th><th style="text-align:right">大小</th><th>含义</th></tr></thead>
+  <tbody>
+    <tr><td class="nm">行（时间）</td><td class="num">130</td>
+        <td><b>124 + 6</b>。训练只用前 124 帧，多写 6 帧是保险 ——
+            切片按时长写盘，<code>floor(时长 × 24)</code> 有可能算出 123，
+            多几帧保证绝不会短。<b>这 6 帧是丢掉的</b>，不参与任何计算。</td></tr>
+    <tr><td class="nm">列（通道）</td><td class="num">17</td>
+        <td><b>11 + 3 + 3</b>，见下表</td></tr>
+  </tbody>
+</table></div>
+<div class="scroll"><table>
+  <thead><tr><th>通道组</th><th style="text-align:right">数量</th><th>具体</th><th>用途</th></tr></thead>
+  <tbody>
+    <tr><td class="nm">按键</td><td class="num">11</td>
+        <td class="nm">W A S D Q E I J K L Space</td>
+        <td>原始录像记录的全部按键。<b>只用其中 8 个</b>
+            （W A S D I J K L）—— Q、E、Space 在这批数据里没有可用信号</td></tr>
+    <tr><td class="nm">相机旋转</td><td class="num">3</td>
+        <td class="nm">d_pitch d_yaw d_roll</td>
+        <td rowspan="2">COLMAP 从 <code>sparse/0/images.txt</code> 反推的逐帧相机运动。
+            <b>录像里没有这些，是自己算出来的</b>。第 9 位 <code>F</code>（速度档）
+            就来自 <code>d_yaw</code> 的实测速率</td></tr>
+    <tr><td class="nm">相机平移</td><td class="num">3</td>
+        <td class="nm">d_x_right d_y_down d_z_fwd</td></tr>
+  </tbody>
+</table></div>
+<div class="note">
+<p><b>为什么非要 COLMAP 那 6 个通道。</b>按键只说"按了 J"，说不出"摇得多快"。
+实测：按 J 的步里 slowly / sharply 各占 0.66 / 0.34，接近抛硬币 —— 键里没有这个信息。
+所以第 9 位由 COLMAP 实测速率合成，它是<b>唯一真正超出原始 8 bit 的信息</b>。
+早期还因为只读了 <code>d_yaw</code>/<code>d_pitch</code>、漏掉 3 个平移通道，
+导致 23% 的标注写着"相机静止"而相机其实在平移。</p>
+</div>
+
+<h3>③ 37 句 → 451 行：每句不是等长的</h3>
+<p class="sub">451 ÷ 37 = 12.19，不是整数 —— 因为<b>行数由句子的 token 数决定</b>，
+句子长行数就多。实测这条样本：</p>
+<div class="scroll"><table>
+  <thead><tr><th>行数</th><th style="text-align:right">句数</th><th>例句</th></tr></thead>
+  <tbody>
+    <tr><td class="num">8</td><td class="num">6</td>
+        <td class="nm">the man stands still, camera holds steady</td></tr>
+    <tr><td class="num">13</td><td class="num">31</td>
+        <td class="nm">the man stands still, camera pans left sharply and tilts up</td></tr>
+    <tr><td class="nm">合计</td><td class="num">37 句</td><td class="nm">451 行（均值 12.19）</td></tr>
+  </tbody>
+</table></div>
+<p>最短的是"站着不动 + 相机不动"这种什么都没发生的句子（8 行），
+带上摇镜、俯仰、速度档之后就涨到 13 行。<b>每条标注在序列里占的行数因此逐条不同</b>，
+所以缓存里要专门存一张 <code>action_text_rows</code> 表
+（<span class="t-mono">[37, 2]</span>，每行是这条标注的起止行号），
+掩码才知道该把哪几行绑到第 k 帧上。</p>
+<div class="note">
+<p><b>这也是为什么要统一 padding。</b>句子长度逐条不同 → 文本段总长逐条不同 →
+序列总长逐条不同。而 <code>flex_attention</code> 是 <code>torch.compile</code> 过的，
+每换一个长度就重编译一次，几步就撞满上限。所以全数据集统一补到 <b>16,448</b>。</p>
+</div>
+
+<h3>④ 390 行/latent 帧：是的，每一帧都一样</h3>
+<p class="sub">这个数字完全由<b>分辨率</b>决定，与内容无关，所以每个 latent 帧都是 390 行：</p>
+<figure>
+<svg viewBox="0 0 1000 130" role="img" aria-label="390 行的来历：480x832 的画面经 VAE 下采样 16 倍得到 30x52 的格点，再按 2x2 patch 合并成 15x26 = 390 个 token">
+  <defs>
+    <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g font-family="IBM Plex Mono, monospace" font-size="12" fill="currentColor">
+    <rect x="20" y="34" width="180" height="56" rx="6" fill="none" stroke="currentColor" stroke-width="1.5"/>
+    <text x="110" y="58" text-anchor="middle">480 × 832</text>
+    <text x="110" y="76" text-anchor="middle" font-size="10.5" opacity=".65">画面像素</text>
+
+    <line x1="206" y1="62" x2="256" y2="62" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar3)"/>
+    <text x="231" y="52" text-anchor="middle" font-size="10" opacity=".7">VAE ÷16</text>
+
+    <rect x="262" y="34" width="180" height="56" rx="6" fill="none" stroke="currentColor" stroke-width="1.5"/>
+    <text x="352" y="58" text-anchor="middle">30 × 52</text>
+    <text x="352" y="76" text-anchor="middle" font-size="10.5" opacity=".65">latent 格点 = 1,560</text>
+
+    <line x1="448" y1="62" x2="498" y2="62" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar3)"/>
+    <text x="473" y="52" text-anchor="middle" font-size="10" opacity=".7">patch 2×2</text>
+
+    <rect x="504" y="34" width="180" height="56" rx="6" fill="none" stroke="var(--c-video)" stroke-width="2"/>
+    <text x="594" y="58" text-anchor="middle" fill="var(--c-video)">15 × 26 = 390</text>
+    <text x="594" y="76" text-anchor="middle" font-size="10.5" opacity=".65">序列里的 token 行</text>
+
+    <line x1="690" y1="62" x2="740" y2="62" stroke="currentColor" stroke-width="1.5" marker-end="url(#ar3)"/>
+    <text x="715" y="52" text-anchor="middle" font-size="10" opacity=".7">×37</text>
+
+    <rect x="746" y="34" width="200" height="56" rx="6" fill="var(--c-video)" opacity=".9"/>
+    <text x="846" y="58" text-anchor="middle" fill="#fff" font-weight="600">14,430 行</text>
+    <text x="846" y="76" text-anchor="middle" font-size="10.5" fill="#fff" opacity=".85">整段 video</text>
+
+    <text x="20" y="116" font-size="10.5" opacity=".75">缓存里 input_latents 的真实形状 [1, 24, 37, 30, 52] —— 24 是通道数，37 是 latent 帧，30×52 是空间格点</text>
+  </g>
+</svg>
+<figcaption><b>390 是分辨率的函数，不是内容的函数。</b>
+换分辨率这个数就变（比如 720×1280 会变成 45×80÷4 = 900）。
+首帧条件 <code>cond</code> 也正好是 390 行 —— 它就是一帧画面，走同一条编码路径。</figcaption>
+</figure>
+
+<h2>五、训练时到底训了什么</h2>
 <div class="scroll"><table>
   <thead><tr><th>部分</th><th>是否可训练</th><th>规模</th><th>说明</th></tr></thead>
   <tbody>
@@ -371,7 +529,7 @@ bias 和 FiLM 一个加性一个乘性、机制完全不同，却给出同一个
 <code>mask_mod</code> 闭包被编译进 kernel 后复用，导致<b>第一条样本之后的每一条都用着第一条的掩码</b>。</p>
 </div>
 
-<h2>五、关键数字一览</h2>
+<h2>六、关键数字一览</h2>
 <div class="scroll"><table>
   <thead><tr><th>项</th><th style="text-align:right">值</th><th>来自</th></tr></thead>
   <tbody>

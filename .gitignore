@@ -34,5 +34,6 @@ __pycache__/
 docs/action_prompt_viz.html
 docs/action_prompt_text_viz.html
 docs/action_ab_viz.html
+docs/longvid_viz.html
 # 例外：架构图页是纯 SVG、35 KB、无外部依赖，入库。
 !docs/action_injection_arch.html

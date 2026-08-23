@@ -68,11 +68,16 @@
 |---|---|---|
 | 推理结果核对台 | 生成 vs 真实片段 | https://claude.ai/code/artifact/e281885a-2132-46ba-8dc0-9617db13b66b |
 | 换按键对照台 | 生成 vs 另一个生成（同首帧换按键） | https://claude.ai/code/artifact/e84b3ed3-37aa-42b7-81ab-02a536bc2d8a |
+| 长视频实测对照台 | 一次生成 10s vs 分块续写 15.5s + 逐帧变化量曲线 | https://claude.ai/code/artifact/37cfff37-0311-4ea8-a1b6-5e9194d991c3 |
 | 架构图 | 注入机制（纯 SVG，已入库） | https://claude.ai/code/artifact/417e81bd-93c8-4a6b-a899-c796d424b737 |
 
 重建方式：
 
 ```bash
+# 长视频实测对照台
+bash code/abot/run_chunked_continue.sh 3
+python3 code/abot/build_longvid_viz.py
+
 # 推理结果核对台（跑完 8 卡推理会自动生成）
 bash code/abot/run_infer8_text.sh 0 1 2 3 4 5 6 7
 
