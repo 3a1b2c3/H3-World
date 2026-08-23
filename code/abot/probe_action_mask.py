@@ -10,6 +10,12 @@
   2. 标注行 k 只看得见第 k 帧的 video 行，看不见第 j≠k 帧
   3. video×video、锚点×video、标注×标注、标注×cond 全部未被触碰
   4. 与显式布尔掩码的参考实现逐位一致
+  5. padding 行被屏蔽：真实行看不见 pad 行，pad 行只看得见自己（否则 softmax 出 NaN）
+  6. **掩码复用一致性**：连续用多个不同的掩码，每个都必须对。这条最要紧 ——
+     flex_attention 是 torch.compile 过的，mask_mod 闭包会被内联进 kernel；
+     早先每条样本新建闭包时，实测第二次调用会复用第一次烘焙进去的掩码逻辑
+     （换顺序跑，先跑的对、后跑的错 3.02），训练里就是每条样本都用着第一条的掩码，
+     全程不报错。改成闭在持久缓冲区上才解决。
 
 用法:
     python3 code/abot/probe_action_mask.py
@@ -46,7 +52,7 @@ def layout():
     return ann_rows, cu
 
 
-def reference_mask(ann_rows) -> torch.Tensor:
+def reference_mask(ann_rows, n_real=None) -> torch.Tensor:
     """参考实现：直接按定义摊成 [USED, USED] 的布尔矩阵。True = 允许。"""
     ann_of = torch.full((SEQ,), -1, dtype=torch.long)
     for k in range(LATENT_T):
@@ -59,7 +65,11 @@ def reference_mask(ann_rows) -> torch.Tensor:
     akv, fkv = a[None, :], f[None, :]
     blocked = (((aq >= 0) & (fkv >= 0) & (aq != fkv))
                | ((fq >= 0) & (akv >= 0) & (fq != akv)))
-    return ~blocked
+    lim = USED if n_real is None else n_real
+    idx = torch.arange(USED)
+    real = (idx[:, None] < lim) & (idx[None, :] < lim)
+    same = idx[:, None] == idx[None, :]
+    return same | (real & ~blocked)
 
 
 def main() -> None:
@@ -128,6 +138,43 @@ def main() -> None:
     print(f"  [3] 其余全部未被触碰                  : {'✓' if untouched else '✗'}")
     if not untouched:
         fails.append(3)
+
+    # 判据 5：padding 屏蔽
+    n_real = USED - 6                       # 末尾 6 行当作 padding
+    masks_p = _build_action_block_masks(ann_rows, V0, FRAME_ROWS, LATENT_T,
+                                        cu.to(dev), SEQ, dev, n_real=n_real)
+    got_p = _sdpa_varlen_attention(q, k, v, cu.to(dev), scale, block_masks=masks_p)
+    allow_p = reference_mask(ann_rows, n_real).to(dev)
+    ref_p = torch.nn.functional.scaled_dot_product_attention(
+        qq, kk, vv, attn_mask=allow_p[None, None], scale=scale)
+    err_p = (got_p[:USED] - ref_p.squeeze(0).transpose(0, 1)).abs().max().item()
+    Ap = allow_p.cpu()
+    no_see_pad = all(not bool(Ap[i, j]) for i in range(n_real) for j in range(n_real, USED))
+    pad_self = all(bool(Ap[i, i]) for i in range(n_real, USED))
+    pad_only_self = all(not bool(Ap[i, j]) for i in range(n_real, USED)
+                        for j in range(USED) if i != j)
+    ok5 = err_p < 2e-4 and no_see_pad and pad_self and pad_only_self
+    print(f"  [5] padding 行被正确屏蔽              : {'✓' if ok5 else '✗'}  "
+          f"max|Δ| = {err_p:.2e}（真实行看不见 pad {no_see_pad}，"
+          f"pad 只看自己 {pad_only_self and pad_self}）")
+    if not ok5:
+        fails.append(5)
+
+    # 判据 6：连续用多个不同的掩码，每个都要对
+    errs = []
+    for nr in (None, USED - 6, USED - 12, None, USED - 3):
+        mk = _build_action_block_masks(ann_rows, V0, FRAME_ROWS, LATENT_T,
+                                       cu.to(dev), SEQ, dev, n_real=nr)
+        g = _sdpa_varlen_attention(q, k, v, cu.to(dev), scale, block_masks=mk)
+        al = reference_mask(ann_rows, nr).to(dev)
+        r = torch.nn.functional.scaled_dot_product_attention(
+            qq, kk, vv, attn_mask=al[None, None], scale=scale).squeeze(0).transpose(0, 1)
+        errs.append((g[:USED] - r).abs().max().item())
+    ok6 = max(errs) < 2e-4
+    print(f"  [6] 连续 {len(errs)} 个不同掩码全部正确      : {'✓' if ok6 else '✗'}  "
+          f"max|Δ| = {max(errs):.2e}")
+    if not ok6:
+        fails.append(6)
 
     blocked_frac = 1 - A.float().mean().item()
     print(f"\n  被屏蔽的元素占 {blocked_frac:.3f}"

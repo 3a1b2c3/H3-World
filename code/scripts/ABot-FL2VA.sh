@@ -55,6 +55,8 @@ DATA_BASE="${DATA_BASE:-$PROJECT_ROOT/data/clips}"
 if [ -z "${META:-}" ]; then
   case "$SUBSET" in
     7872) META="$PROJECT_ROOT/data/abot_meta_train_7872.jsonl" ;;
+    # 20000 = 20128 全量减去沿用的那 128 条测试集（见 split 的 --fixed-test）
+    20000) META="$PROJECT_ROOT/data/abot_meta_train_20000.jsonl" ;;
     128) META="$PROJECT_ROOT/data/abot_meta_test_128.jsonl" ;;
     *) META="$PROJECT_ROOT/data/abot_meta_${SUBSET}.jsonl" ;;
   esac

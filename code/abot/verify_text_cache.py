@@ -11,6 +11,9 @@
   4. 镜像偏移：每条标注与自己那帧的 t 偏移是同一个负常数
   5. token_tags：头部保留原标签（图像 pad 走 video 组），标注行全为文本
   6. 视频/音频 latent 未被动过（形状仍是 stage 1 的）
+  7. action_real_used 存在且 ≤ padding 后的长度
+  8. **seq_len 全数据集唯一** —— 这是 padding 的全部目的：flex_attention 每换一个
+     序列长度就重编译一次，长度不统一会撞满 Dynamo 的重编译上限
 
 用法:
     python3 code/abot/verify_text_cache.py --cache output/minimax_h3_abot/7872-cache
@@ -37,7 +40,8 @@ def check_one(path: str) -> tuple[list[str], dict]:
 
     if "action_cond" in kwargs:
         bad.append("action_cond 未删除")
-    for k in ("action_text_rows", "action_video_start", "action_frame_rows"):
+    for k in ("action_text_rows", "action_video_start", "action_frame_rows",
+              "action_real_used"):
         if k not in packed:
             bad.append(f"缺 {k}")
     if bad:
@@ -73,6 +77,11 @@ def check_one(path: str) -> tuple[list[str], dict]:
         if bool((t_ann >= text_len).any()):
             bad.append("有标注的 t 越过 text_len")
 
+    real_used = int(packed["action_real_used"])
+    cu = packed["cu_seqlens"].tolist()
+    if real_used > cu[1]:
+        bad.append(f"action_real_used {real_used} > padding 后长度 {cu[1]}")
+
     tags = packed["token_tags"][packed["text_pos"]]
     if int((tags[head_len:] != 1).sum()):
         bad.append("标注行的 token_tags 不全为 1")
@@ -84,7 +93,8 @@ def check_one(path: str) -> tuple[list[str], dict]:
         bad.append(f"input_latents 形状异常 {tuple(il)}")
 
     return bad, {"text_len": text_len, "head_len": head_len,
-                 "seq_len": int(packed["seq_len"]), "offset": float(d[0]) if not bad else 0.0,
+                 "seq_len": int(packed["seq_len"]), "padded_used": int(cu[1]),
+                 "real_used": real_used, "offset": float(d[0]) if not bad else 0.0,
                  "n_img": int((tags[:head_len] == 0).sum())}
 
 
@@ -117,7 +127,9 @@ def main() -> None:
     summary = {"n": len(mine), "ok": len(stats), "fail": len(failures),
                "failures": failures[:20]}
     if stats:
-        for key in ("text_len", "head_len", "seq_len", "n_img"):
+        summary["seq_lens"] = sorted({s["seq_len"] for s in stats})
+        summary["padded_used"] = sorted({s["padded_used"] for s in stats})
+        for key in ("text_len", "head_len", "seq_len", "real_used", "n_img"):
             v = np.array([s[key] for s in stats])
             summary[key] = [int(v.min()), int(v.max()), float(v.mean())]
         summary["offsets"] = sorted({round(s["offset"], 3) for s in stats})

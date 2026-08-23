@@ -30,6 +30,7 @@
 
 完整设计与推导：[`docs/action_text_injection_plan.html`](docs/action_text_injection_plan.html) ·
 管线状态与实测：[`docs/pipeline_text_injection.md`](docs/pipeline_text_injection.md) ·
+过程记录（问题与修法）：[`docs/journey.md`](docs/journey.md) ·
 文档索引：[`docs/README.md`](docs/README.md)
 
 ### 走到这一步之前失败的两次
@@ -74,7 +75,9 @@ code/
     probe_action_mask.py      ★ 掩码落点探针（改 DiT 后必跑）
     probe_text_channel.py     零训练探针：文本通道控不控运动
     analyze_probe.py          探针判据：相位相关估全局平移
-    build_action_viz.py       标注核对台（视频 + 逐 latent 标注同步高亮）
+    build_action_viz.py       标注核对台（标注 vs GT，验数据）
+    build_text_infer_viz.py   ★ 推理结果核对台（生成 vs GT，验模型）
+    build_action_ab_viz.py    ★ 换按键对照台（生成 vs 另一个生成）+ 位移测量
     build_compare_page.py     GT / Generated 横版对比页
     merge_runs.py             多卡各出一条时，合并成一个结果目录
     viz_action.py             动作 HUD 渲染
@@ -82,16 +85,23 @@ code/
     inject_abot_action.py     旧路径：动作张量注入（ACTION_MODE=cond，仅供对照）
     compare_action_ckpt.py    旧判据：动作层权重差分（对新方案失效）
     check_action_grad.py      旧探针：动作层梯度是否流动
-  scripts/ABot-FL2VA.sh     训练入口（两阶段：缓存 latent -> 训 LoRA）
+    run_infer8_text.sh        ★ 8 卡并行推理，跑完自动出核对页
+    run_action_ab8.sh         同首帧换按键的 8 卡对照实验
+    run_chunked_continue.sh   分块续写：上一段尾帧当下一段首帧
+  scripts/
+    ABot-FL2VA.sh           训练入口（两阶段：缓存 latent -> 训 LoRA）
+    run_text_pipeline.sh    ★ 一条命令：探针 -> 数据构建 -> 校验 -> 起训
   vrising/                  前一阶段（V-Rising 数据）的脚本，保留备查
-  diffsynth_h3_action.patch DiffSynth 框架的全部改动（5 文件 623 行）
+  diffsynth_h3_action.patch DiffSynth 框架的全部改动（6 文件 714 行）
   diffsynth_base_commit.txt 补丁对应的 base commit
 docs/                       见 docs/README.md
 env.sh                      环境变量
 ```
 
-**不在仓库里**（见 `.gitignore`）：框架与 134 GB 权重、38.5 GB 视频切片、
-68 GB latent 缓存与 checkpoint、运行时缓存与日志。
+**不在仓库里**（见 `.gitignore`）：框架与 134 GB 权重、91 GB 视频切片、
+357 GB latent 缓存与 checkpoint、运行时缓存与日志，以及**内嵌视频的可视化页**
+（3–6 MB/个，是生成物；在线版链接见 `docs/README.md`）。
+唯一入库的页面是 `docs/action_injection_arch.html` —— 纯 SVG，35 KB，无外部依赖。
 
 ---
 
@@ -129,7 +139,14 @@ NUM_PROCESSES=8 STAGE=2 OUT=output/minimax_h3_abot/7872_text \
 python3 code/abot/infer_abot.py --checkpoint <ckpt> --cfg-scale 5.0 --num-samples 8
 ```
 
-改动 DiT 之后**必须**先跑掩码探针，四条判据全过才继续：
+或者一条命令跑完第 5–6 步（探针 → 数据构建 → 校验 → 起训，每步不过就停）：
+
+```bash
+bash code/scripts/run_text_pipeline.sh
+```
+
+改动 DiT 之后**必须**先跑掩码探针，六条判据全过才继续。其中第 6 条
+（连续多个不同掩码全部正确）抓的是静默数据损坏，见 `docs/journey.md` §6：
 
 ```bash
 python3 code/abot/probe_action_mask.py
@@ -147,6 +164,7 @@ python3 code/abot/probe_action_mask.py
 | 镜像偏移 | 标注与自己那帧的 t 偏移恒为 **−201**，7872 条全同 |
 | 掩码构建 | 16k 序列上 12.3 ms/forward，50 层共用，占训练步 0.12% |
 | 掩码代价 | 注意力从 flash 切到 FlexAttention，**慢 23%**（2.41 → 2.97 s/it） |
+| 掩码正确性 | 闭包必须闭在持久缓冲区上，否则第二条样本起全用第一条的掩码且不报错 |
 
 硬件：8 × H200（143.7 GB）。
 

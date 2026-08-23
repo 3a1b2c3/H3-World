@@ -63,11 +63,21 @@ FORMAL_CHECKPOINT_DIR = PROJECT_ROOT / "output/minimax_h3_abot/7872"
 DEFAULT_METADATA = PROJECT_ROOT / "data/abot_meta_test_128.jsonl"
 DEFAULT_CLIP_ROOT = PROJECT_ROOT / "data/clips"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "output/abot_inference"
-NUM_FRAMES = 124
+NUM_FRAMES = 124               # 默认；--num-frames 可改，必须是 17k+5
 HEIGHT = 480
 WIDTH = 832
 FPS = 24
 LATENT_T = A.latent_t_for(NUM_FRAMES)
+
+
+def set_frames(n: int) -> None:
+    """改全局帧数。必须是 17k+5 —— H3 每 5 个潜在帧覆盖 17 个真实帧（1,4,4,4,4），
+    不是这个形状的话 latent_t 对不齐，动作分箱会错位。"""
+    global NUM_FRAMES, LATENT_T
+    if (n - 5) % 17:
+        raise ValueError(f"num_frames 必须是 17k+5，得到 {n}（最近的合法值："
+                         f"{((n - 5) // 17) * 17 + 5} 或 {((n - 5) // 17 + 1) * 17 + 5}）")
+    NUM_FRAMES, LATENT_T = n, A.latent_t_for(n)
 EXPECTED_ACTION_DIM = len(A.ACTIVE_KEY_COLS)
 
 
@@ -130,6 +140,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Bypass the free-VRAM safety check. Use only when GPU sharing is intentional.",
     )
+    parser.add_argument(
+        "--action-preset",
+        default=None,
+        help="用预设按键序列覆盖片段自带的动作（同首帧换 action 的对照实验）。"
+             "可选：still, forward, back, strafe-left, strafe-right, pan-left, "
+             "pan-right, pan-right-fast。不传则用片段自己的按键。",
+    )
+    parser.add_argument("--num-frames", type=int, default=None,
+                        help="生成帧数，必须是 17k+5（124=5.2s, 243=10.1s, 481=20.0s）。"
+                             "默认 124。片段自带的按键不够长时会循环平铺补足。")
+    parser.add_argument("--action-random", type=int, default=None, metavar="SEED",
+                        help="用随机按键序列（按 4-10 个 latent 分段）替代片段自带的动作。")
+    parser.add_argument("--first-frame", type=Path, default=None,
+                        help="用这张图片当首帧（分块续写：上一段的尾帧）。默认用片段首帧。")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--check-only",
@@ -297,15 +321,86 @@ def resolve_data_file(clip_root: Path, relative: str) -> Path:
     return path
 
 
-def load_action(row: dict, clip_root: Path) -> tuple[np.ndarray, dict[str, dict[str, float | int]]]:
+# 同首帧、换按键的对照组。键是预设名，值是「整段按住哪几个键」。
+# 这是粗粒度判据：只回答"换 action 出不出不同且符合的结果"，
+# 回答不了"第 k 条标注绑不绑第 k 帧"—— 那要逐 latent 只改一条，是另一个工具。
+ACTION_PRESETS: dict[str, tuple[str, ...]] = {
+    "still":      (),
+    "forward":    ("W",),
+    "back":       ("S",),
+    "strafe-left":  ("A",),
+    "strafe-right": ("D",),
+    "pan-left":   ("J",),
+    "pan-right":  ("L",),
+    "pan-right-fast": ("L", "F"),
+}
+
+
+def random_keys9(seed: int, latent_t: int | None = None) -> np.ndarray:
+    """随机按键序列：按段生成而不是逐 latent 抖，否则每帧换一个动作没法看。
+    段长 4–10 个 latent，同一段内保持同一组键。"""
+    lt = LATENT_T if latent_t is None else latent_t
+    rng = np.random.default_rng(seed)
+    k9 = np.zeros((lt, len(S.KEYS9)), dtype=np.int64)
+    move = ["W", "S", "A", "D", None]
+    cam = ["J", "L", "I", "K", None]
+    i = 0
+    while i < lt:
+        n = int(rng.integers(4, 11))
+        m, c = move[rng.integers(len(move))], cam[rng.integers(len(cam))]
+        for key in (m, c):
+            if key:
+                k9[i:i + n, S.KEYS9.index(key)] = 1
+        if c in ("J", "L") and rng.random() < 0.4:
+            k9[i:i + n, S.KEYS9.index("F")] = 1
+        i += n
+    return k9
+
+
+def tile_keys9(k9: np.ndarray, latent_t: int) -> np.ndarray:
+    """片段自带的按键不够长时循环平铺补足。10s 需要 72 条，片段只给得出 37 条。"""
+    if k9.shape[0] >= latent_t:
+        return k9[:latent_t]
+    reps = -(-latent_t // k9.shape[0])
+    return np.tile(k9, (reps, 1))[:latent_t]
+
+
+def preset_keys9(name: str) -> np.ndarray:
+    """把预设名展开成 [LATENT_T, 9] 的按键矩阵，全程保持同一组键按住。"""
+    if name not in ACTION_PRESETS:
+        raise ValueError(f"未知预设 {name}；可选：{', '.join(ACTION_PRESETS)}")
+    k9 = np.zeros((LATENT_T, len(S.KEYS9)), dtype=np.int64)
+    for key in ACTION_PRESETS[name]:
+        k9[:, S.KEYS9.index(key)] = 1
+    return k9
+
+
+def load_action(row: dict, clip_root: Path, preset: str | None = None) -> tuple[np.ndarray, dict[str, dict[str, float | int]]]:
     path = resolve_data_file(clip_root, row["action"])
     matrix = np.load(path, allow_pickle=False)
-    if matrix.ndim != 2 or matrix.shape[0] < NUM_FRAMES or matrix.shape[1] != A.ACTION_DIM:
-        raise ValueError(
-            f"{path}: expected at least [{NUM_FRAMES},{A.ACTION_DIM}], got {list(matrix.shape)}"
-        )
-    pooled = A.bin_to_latent(matrix[:NUM_FRAMES], LATENT_T)
+    if matrix.ndim != 2 or matrix.shape[1] != A.ACTION_DIM:
+        raise ValueError(f"{path}: expected [*,{A.ACTION_DIM}], got {list(matrix.shape)}")
+    # 片段只有 130 帧。要生成更长的视频时，按键先按片段自己的长度算，再平铺补足 ——
+    # 动作是**输入**不是真值，补出来的部分不影响"生成的画面听不听按键的话"这个判断。
+    # 分箱要求帧数本身也是 17k+5，而片段写盘时多写了 6 帧（130）。
+    # 取不超过可用帧数的最大合法值，别直接拿 min() —— 130 不是合法形状。
+    avail = min(NUM_FRAMES, matrix.shape[0])
+    avail = ((avail - 5) // 17) * 17 + 5
+    pooled = A.bin_to_latent(matrix[:avail], A.latent_t_for(avail))
     keys9 = S.keys9(pooled)                      # [latent_t, 9]，第 9 位由 COLMAP 速率导出
+    if keys9.shape[0] != LATENT_T:
+        keys9 = tile_keys9(keys9, LATENT_T)
+        pooled = tile_keys9(pooled, LATENT_T)
+    if isinstance(preset, np.ndarray):
+        keys9 = preset[:LATENT_T]
+        pooled = pooled.copy()
+        pooled[:, A.ACTIVE_KEY_INDICES] = keys9[:, :EXPECTED_ACTION_DIM]
+    elif preset is not None:
+        # 只换按键，首帧 / 场景描述 / seed 全部不动 —— 对照实验的变量必须只有一个。
+        # 文本是按键的纯函数，所以替掉 keys9 之后整条链路无需再改。
+        keys9 = preset_keys9(preset)
+        pooled = pooled.copy()
+        pooled[:, A.ACTIVE_KEY_INDICES] = keys9[:, :EXPECTED_ACTION_DIM]
     script = S.annotate_from_keys9(keys9)        # 与训练时同一条规则表
     action = pooled[:, A.ACTIVE_KEY_INDICES].astype(np.float32, copy=False)
     if action.shape != (LATENT_T, EXPECTED_ACTION_DIM):
@@ -321,11 +416,11 @@ def load_action(row: dict, clip_root: Path) -> tuple[np.ndarray, dict[str, dict[
     return action, summary, keys9, script
 
 
-def validate_samples(rows: list[dict], clip_root: Path) -> list[dict]:
+def validate_samples(rows: list[dict], clip_root: Path, preset: str | None = None) -> list[dict]:
     validated = []
     for row in rows:
         video = resolve_data_file(clip_root, row["video"])
-        action, summary, keys9, script = load_action(row, clip_root)
+        action, summary, keys9, script = load_action(row, clip_root, preset)
         validated.append({
             "row": row,
             "video": video,
@@ -575,6 +670,15 @@ def load_pipeline(checkpoint: Path, info: CheckpointInfo, device: str, total_gib
     return pipe
 
 
+def probe_frame_count(path: Path) -> int:
+    import av
+    with av.open(str(path)) as container:
+        n = container.streams.video[0].frames
+        if n:
+            return int(n)
+        return sum(1 for _ in container.decode(video=0))
+
+
 def read_video_frames(path: Path, count: int):
     import av
 
@@ -641,7 +745,11 @@ def run_inference(
             "steps": args.steps,
             "selection_seed": args.selection_seed,
             "generation_seed": args.generation_seed,
-            "conditioning": "first_frame+8d_actions",
+            "action_preset": (f"random(seed={args.action_random})" if args.action_random is not None
+                          else args.action_preset or "(片段自带)"),
+        "first_frame": str(args.first_frame) if args.first_frame else "(片段首帧)",
+        "num_frames_actual": NUM_FRAMES,
+        "conditioning": "first_frame+8d_actions",
             "action_columns": A.ACTIVE_KEY_COLS,
         },
         "samples": [],
@@ -675,8 +783,12 @@ def run_inference(
         try:
             need_gt = args.overwrite or not gt_path.is_file()
             need_generated = args.overwrite or not generated_path.is_file()
-            frames = read_video_frames(sample["video"], NUM_FRAMES) if (need_gt or need_generated) else None
-            if need_gt:
+            # 生成时长超过片段长度时（例如 10s 的探底实验），GT 根本不存在。
+            # 只读片段实际有的帧：首帧照样拿得到，GT 则退化成"没有"。
+            gt_frames = min(NUM_FRAMES, probe_frame_count(sample["video"]))
+            frames = read_video_frames(sample["video"], gt_frames) if (need_gt or need_generated) else None
+            have_gt = frames is not None and len(frames) >= NUM_FRAMES
+            if need_gt and have_gt:
                 write_video_atomic(
                     write_video_audio,
                     video=frames,
@@ -684,6 +796,12 @@ def run_inference(
                     path=gt_path,
                 )
             if need_generated:
+                # 分块续写：上一段的尾帧当这一段的首帧。keyframes 收的是普通 PIL 图片，
+                # 所以这条路不需要动架构。
+                first_frame_override = None
+                if args.first_frame is not None:
+                    from PIL import Image
+                    first_frame_override = Image.open(args.first_frame).convert("RGB")
                 gen_kwargs = dict(
                     prompt=row["prompt"],
                     negative_prompt=args.negative_prompt,
@@ -692,7 +810,7 @@ def run_inference(
                     num_frames=NUM_FRAMES,
                     num_inference_steps=args.steps,
                     seed=seed,
-                    keyframes=[frames[0]],
+                    keyframes=[first_frame_override or frames[0]],
                     keyframe_indices=[0],
                     cfg_scale=args.cfg_scale,
                 )
@@ -744,7 +862,14 @@ def main() -> None:
     model_files = check_local_models()
     rows = read_metadata(args.metadata)
     selected = select_rows(rows, args.sample_id, args.num_samples, args.selection_seed)
-    samples = validate_samples(selected, args.clip_root)
+    if args.num_frames is not None:
+        set_frames(args.num_frames)
+        print(f"帧数     : {NUM_FRAMES} 帧 ({NUM_FRAMES / 24:.1f}s), latent_t={LATENT_T}")
+    action_src = args.action_preset
+    if args.action_random is not None:
+        action_src = random_keys9(args.action_random)
+        print(f"动作源   : 随机 seed={args.action_random}")
+    samples = validate_samples(selected, args.clip_root, action_src)
 
     print(f"Checkpoint : {info.path}")
     print(

@@ -19,21 +19,66 @@ from pathlib import Path
 
 STUB = r"""
 // 最小 DOM 桩：脚本能跑完且往目标容器写进了内容，就说明渲染路径通。
+//
+// 桩要撑到什么程度，是被页面用到的 API 决定的 —— 只支持 innerHTML 的版本
+// 跑不了 createElement/appendChild 建树的页面，检查器会假报"脚本抛异常"。
+// 所以这里补齐了建树那一套，并且**选择器要真的去匹配 innerHTML**：
+// querySelector 匹配不上就返回 null，让写错的选择器当场暴露 —— 这正是
+// 静态检查抓不到、而线上表现为"某块区域空白"的那类错误。
 const store = {};
-const mkEl = (id) => ({
-  _html: "", id,
-  set innerHTML(v) { this._html = v; store[id] = v; },
-  get innerHTML() { return this._html; },
-  set textContent(v) { store[id] = v; },
-  querySelectorAll: () => [], addEventListener: () => {},
-  classList: { toggle() {}, add() {}, remove() {} },
-});
+
+function selRe(sel) {
+  // 只取最后一个简单选择器：'.said .t' 这类后代选择器在真浏览器里没问题，
+  // 桩里不实现完整的层级匹配，否则要建真 DOM 树。代价是祖先写错了这里查不出来，
+  // 但"整条渲染路径能不能跑完"这个目的达到了 —— 别让判据自己成为误报源。
+  const s = sel.trim().split(/\s+/).pop();
+  if (s.startsWith('.')) return new RegExp('class="[^"]*\\b' + s.slice(1) + '\\b[^"]*"', 'g');
+  if (s.startsWith('#')) return new RegExp('id="' + s.slice(1) + '"', 'g');
+  return new RegExp('<' + s + '[\\s>]', 'g');
+}
+
+function mkNode(id) {
+  const node = {
+    id, _html: "", children: [], style: {}, dataset: {},
+    set innerHTML(v) { this._html = String(v); if (id) store[id] = this._html; },
+    get innerHTML() { return this._html; },
+    set textContent(v) { this._text = String(v); if (id) store[id] = this._text; },
+    get textContent() { return this._text || ""; },
+    appendChild(c) {
+      this.children.push(c);
+      if (id) store[id] = (store[id] || "") + (c._html || "") + (c._text || "");
+      return c;
+    },
+    querySelectorAll(sel) {
+      const n = (this._html.match(selRe(sel)) || []).length;
+      return Array.from({ length: n }, () => mkNode(null));
+    },
+    querySelector(sel) {
+      return selRe(sel).test(this._html) ? mkNode(null) : null;
+    },
+    addEventListener() {}, removeEventListener() {}, remove() {}, focus() {},
+    getAttribute: () => null, setAttribute() {},
+    classList: {
+      _s: new Set(),
+      add(...c) { c.forEach(x => this._s.add(x)); },
+      remove(...c) { c.forEach(x => this._s.delete(x)); },
+      toggle(c) { this._s.has(c) ? this._s.delete(c) : this._s.add(c); },
+      contains(c) { return this._s.has(c); },
+    },
+  };
+  return node;
+}
+
 const els = {};
 global.document = {
-  getElementById: (id) => (els[id] = els[id] || mkEl(id)),
+  getElementById: (id) => (els[id] = els[id] || mkNode(id)),
+  createElement: () => mkNode(null),
+  createTextNode: () => mkNode(null),
   querySelectorAll: () => [], querySelector: () => null,
   addEventListener: () => {},
+  body: mkNode(null),
 };
+global.window = { addEventListener: () => {}, matchMedia: () => ({ matches: false, addEventListener() {} }) };
 require(process.argv[2]);
 console.log(JSON.stringify(Object.fromEntries(
   Object.entries(store).map(([k, v]) => [k, String(v).length]))));

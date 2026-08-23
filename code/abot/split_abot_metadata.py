@@ -40,6 +40,13 @@ def main() -> None:
     parser.add_argument("--test-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=20260820)
     parser.add_argument("--clips-dir", required=True)
+    parser.add_argument(
+        "--fixed-test",
+        default=None,
+        help="沿用已有测试集：从这个 jsonl 读 sample_id，把它们全部划为测试、其余为训练。"
+             "扩数据时必须用它 —— hash 选法只对固定的输入集合稳定，输入从 16000 变成 "
+             "20128 之后同一个 seed 会选出**不同的** 128 条，导致新训练集里混进旧测试样本。",
+    )
     args = parser.parse_args()
 
     with open(args.input, encoding="utf-8") as handle:
@@ -51,7 +58,18 @@ def main() -> None:
     if len(ids) != len(set(ids)):
         raise SystemExit("sample_id is not unique; refusing an episode-leaking split")
 
-    test_indices = set(sorted(range(len(rows)), key=lambda i: stable_score(ids[i], args.seed))[:args.test_size])
+    if args.fixed_test:
+        with open(args.fixed_test, encoding="utf-8") as handle:
+            keep = {json.loads(line)["sample_id"] for line in handle if line.strip()}
+        missing = keep - set(ids)
+        if missing:
+            raise SystemExit(
+                f"--fixed-test 里有 {len(missing)} 条不在 input 中，例: {sorted(missing)[:3]}")
+        test_indices = {i for i, sid in enumerate(ids) if sid in keep}
+        print(f"沿用固定测试集 {args.fixed_test}：{len(test_indices)} 条")
+    else:
+        test_indices = set(sorted(range(len(rows)),
+                                  key=lambda i: stable_score(ids[i], args.seed))[:args.test_size])
     train_rows = [row for i, row in enumerate(rows) if i not in test_indices]
     test_rows = [row for i, row in enumerate(rows) if i in test_indices]
 

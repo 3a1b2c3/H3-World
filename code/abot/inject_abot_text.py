@@ -54,6 +54,7 @@ import action_script as S  # noqa: E402
 
 LATENT_T = 37
 NUM_FRAMES = 124
+IMAGE_PAD_ROWS = 392          # 首帧过视觉塔的行数，实测在本数据集上恒定
 
 
 def collect_scripts(rows, clip_root: Path) -> tuple[list[list[str]], dict[str, None]]:
@@ -66,6 +67,36 @@ def collect_scripts(rows, clip_root: Path) -> tuple[list[list[str]], dict[str, N
         for line in sc:
             vocab.setdefault(line, None)
     return scripts, vocab
+
+
+def scan_pad_used_to(rows, clip_root: Path, tokenizer, align: int = 64) -> tuple[int, dict]:
+    """全数据集扫一遍，算出统一的 padding 长度。
+
+    必须统一：flex_attention 是 torch.compile 过的，每换一个序列长度就重编译一次，
+    而逐条样本的 text_len 不同，几步就会撞满 Dynamo 的重编译上限。
+
+    这一步很便宜 —— head_len 只用 tokenizer 就能精确算出，不必过视觉塔和编码器：
+    presentation_fl2va = 前缀 + 图像 pad(恒定 392) + prompt，三段长度都可直接数。
+    """
+    from diffsynth.models.minimax_h3_text_encoder import presentation_fl2va
+
+    prefix = len(presentation_fl2va(tokenizer, "", [IMAGE_PAD_ROWS])[0]) - IMAGE_PAD_ROWS
+    ann_len: dict[str, int] = {}
+    stats = {"used": [], "text_len": []}
+    for r in rows:
+        pooled = A.bin_to_latent(np.load(clip_root / r["action"])[:NUM_FRAMES], LATENT_T)
+        script = S.annotate_from_keys9(S.keys9(pooled))
+        for line in script:
+            if line not in ann_len:
+                ann_len[line] = len(tokenizer(line)["input_ids"])
+        head = prefix + IMAGE_PAD_ROWS + len(tokenizer(r["prompt"])["input_ids"])
+        text_len = head + sum(ann_len[x] for x in script)
+        # cond / audio / video 的行数由 latent 尺寸决定，本数据集恒定
+        used = text_len + 390 + 414 + LATENT_T * 390
+        stats["used"].append(used)
+        stats["text_len"].append(text_len)
+    mx = max(stats["used"])
+    return ((mx + align - 1) // align) * align, stats
 
 
 def load_encoder(device: str, dtype=torch.bfloat16):
@@ -123,7 +154,7 @@ def encode_head(pipe, row, clip_root: Path, device: str, height=480, width=832):
 
 
 def rewrite_one(path: str, script: list[str], head, emb: dict[str, torch.Tensor],
-                builder, dry: bool) -> dict:
+                builder, dry: bool, pad_used_to: int | None = None) -> dict:
     data = torch.load(path, map_location="cpu", weights_only=False)
     kwargs, extra = data[0], data[1]
     packed, old_pe = extra["packed"], extra["prompt_embeds"]
@@ -149,13 +180,15 @@ def rewrite_one(path: str, script: list[str], head, emb: dict[str, torch.Tensor]
     keyframe_indices = [0] if n_key == 1 else [0, -1]
 
     new_packed = builder._build_packed_fl2va(
-        text_len, lt, lh, lw, audio_t, keyframe_indices, action_text_spans=spans)
+        text_len, lt, lh, lw, audio_t, keyframe_indices,
+        action_text_spans=spans, pad_used_to=pad_used_to)
     tt = new_packed["token_tags"]
     tt[new_packed["text_pos"]] = 1                         # 标注行都是文本
     tt[new_packed["text_pos"][:head_len]] = head_tags      # 头部沿用原标签（图像 pad 走 video 组）
 
     stat = {"text_len": text_len, "seq_len": int(new_packed["seq_len"]),
             "head_len": head_len, "n_img": int((head_tags == 0).sum()),
+            "real_used": int(new_packed["action_real_used"]),
             "old_text_len": old_tl, "old_seq_len": int(packed["seq_len"])}
     if dry:
         return stat
@@ -178,6 +211,8 @@ def main() -> None:
     ap.add_argument("--shard", type=int, default=0, help="第几个分片（0 起）")
     ap.add_argument("--num-shards", type=int, default=1, help="总分片数；8 卡并行填 8")
     ap.add_argument("--limit", type=int, default=None, help="只处理前 N 条，用于验证")
+    ap.add_argument("--pad-used-to", type=int, default=None,
+                    help="统一的 padding 长度；不给则自动扫全数据集算出（推荐）")
     ap.add_argument("--dry-run", action="store_true", help="只算不写")
     args = ap.parse_args()
 
@@ -209,6 +244,12 @@ def main() -> None:
     print(f"{tag}标注词表 {len(vocab)} 种")
 
     pipe = load_encoder(args.device)
+    pad_used_to = args.pad_used_to
+    if pad_used_to is None:
+        # 注意：要扫**全部** ids（不是本分片），否则各分片算出的值不一致
+        all_ids = sorted(pth)[: args.limit] if args.limit else sorted(pth)
+        pad_used_to, sc = scan_pad_used_to([rows[i] for i in all_ids], clip_root, pipe.tokenizer)
+        print(f"{tag}统一 padding: used {min(sc['used'])}–{max(sc['used'])} -> {pad_used_to}")
     emb = encode_vocab(pipe, vocab, args.device)
     lens = [int(v.shape[0]) for v in emb.values()]
     print(f"{tag}单条标注 {min(lens)}–{max(lens)} 行（均值 {sum(lens) / len(lens):.1f}）")
@@ -220,7 +261,8 @@ def main() -> None:
     stats = []
     for n, (did, sc) in enumerate(zip(ids, scripts)):
         head = encode_head(pipe, rows[did], clip_root, args.device)
-        stats.append(rewrite_one(pth[did], sc, head, emb, builder, args.dry_run))
+        stats.append(rewrite_one(pth[did], sc, head, emb, builder, args.dry_run,
+                                 pad_used_to=pad_used_to))
         if (n + 1) % 100 == 0 or n + 1 == len(ids):
             print(f"{tag}  {'试算' if args.dry_run else '写入'} {n + 1}/{len(ids)}", flush=True)
 
@@ -230,7 +272,10 @@ def main() -> None:
     osl = np.array([s["old_seq_len"] for s in stats])
     print(f"\n{tag}head_len {hl.min()}–{hl.max()}（重新编码，其中图像 pad {stats[0]['n_img']} 行）")
     print(f"{tag}text_len {tl.min()}–{tl.max()}（均值 {tl.mean():.0f}）")
-    print(f"{tag}seq_len  {osl.min()}–{osl.max()} -> {sl.min()}–{sl.max()}")
+    ru = np.array([s["real_used"] for s in stats])
+    print(f"{tag}real_used {ru.min()}–{ru.max()}  ->  统一 padding 到 {pad_used_to}")
+    print(f"{tag}seq_len  {osl.min()}–{osl.max()} -> {sl.min()}–{sl.max()}"
+          f"（唯一值 {sorted(set(sl.tolist()))}）")
     print(f"{tag}" + ("试算完成，未写盘" if args.dry_run else "写入完成，action_cond 已删除"))
 
 

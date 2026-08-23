@@ -1,3 +1,23 @@
+diff --git a/diffsynth/core/attention/attention.py b/diffsynth/core/attention/attention.py
+index c64bb54..f27a729 100644
+--- a/diffsynth/core/attention/attention.py
++++ b/diffsynth/core/attention/attention.py
+@@ -33,7 +33,14 @@ except ModuleNotFoundError:
+ 
+ try:
+     from torch.nn.attention.flex_attention import flex_attention as flex_attention_func
+-    flex_attention_func = torch.compile(flex_attention_func, dynamic=False, mode="max-autotune-no-cudagraphs", fullgraph=True, backend="inductor")
++    # 不用 mode="max-autotune-no-cudagraphs"：它在第一步实测 6 个前向 + 13 个反向候选，
++    # 而候选里有跑不了的 —— H200 上 BLOCK_M=BLOCK_N=128 那个要 233472 B 共享内存、
++    # 硬件上限 232448 B。单个候选废掉本身无害（会被跳过），但基准测试阶段实测到
++    # illegal memory access 会污染整个 CUDA context，8 卡训练里表现为随机某一张卡在
++    # 第 0 步挂掉，且失败结果会写进按 device 分键的磁盘缓存，之后每次复现在同一张卡上。
++    # 实测这个 autotune 一点收益都没有：1x56x16448x128 上赢家永远是默认启发式那个配置，
++    # 稳态 75.6（默认）vs 76.1 ms/iter（autotune）。
++    flex_attention_func = torch.compile(flex_attention_func, dynamic=False, fullgraph=True, backend="inductor")
+     FLEX_ATTN_AVAILABLE = True
+ except (ModuleNotFoundError, ImportError):
+     FLEX_ATTN_AVAILABLE = False
 diff --git a/diffsynth/diffusion/parsers.py b/diffsynth/diffusion/parsers.py
 index cc19051..5550247 100644
 --- a/diffsynth/diffusion/parsers.py
@@ -38,7 +58,7 @@ index 0e2c921..d0a570d 100644
                      offload_manager.after_backward()
  
 diff --git a/diffsynth/models/minimax_h3_dit.py b/diffsynth/models/minimax_h3_dit.py
-index 2a4684e..3092d53 100644
+index 2a4684e..dd76842 100644
 --- a/diffsynth/models/minimax_h3_dit.py
 +++ b/diffsynth/models/minimax_h3_dit.py
 @@ -63,11 +63,33 @@ def _modulate_scale_shift(x, shift, scale, indices):
@@ -76,7 +96,7 @@ index 2a4684e..3092d53 100644
      out = torch.empty_like(q)
      bounds = cu_seqlens.tolist()
      for start, stop in zip(bounds[:-1], bounds[1:]):
-@@ -76,11 +98,57 @@ def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale):
+@@ -76,11 +98,101 @@ def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale):
          seg_q = q[start:stop].transpose(0, 1).unsqueeze(0)
          seg_k = k[start:stop].transpose(0, 1).unsqueeze(0)
          seg_v = v[start:stop].transpose(0, 1).unsqueeze(0)
@@ -91,7 +111,31 @@ index 2a4684e..3092d53 100644
      return out
  
  
-+def _build_action_block_masks(ann_rows, v0, fr, latent_t, cu_seqlens, seq_len, device):
++# 掩码用的持久缓冲区，按 (device, 段起点, 段长) 复用。
++# **必须复用同一批张量对象**：flex_attention 是 torch.compile 过的，mask_mod 闭包会被
++# 内联进 kernel。若每条样本都新建闭包/张量，会出两个后果，且都不报错：
++#   1. Dynamo 每次都判定为新图 -> 几步内撞满重编译上限（FailOnRecompileLimitHit）
++#   2. 更糟：实测把第一次的 mask_mod 烘焙进 kernel 后复用，**后续样本全用着第一条的掩码**
++#      （探针里两个掩码换顺序跑，先跑的对、后跑的错 3.02，坐实了）
++# 闭在固定缓冲区上、每条样本原地改写内容，两个问题一起解决。
++_MASK_BUFFERS: dict = {}
++
++
++def _mask_buffers(device, start: int, length: int):
++    key = (str(device), int(start), int(length))
++    buf = _MASK_BUFFERS.get(key)
++    if buf is None:
++        buf = {
++            "ann": torch.full((length,), -1, dtype=torch.int32, device=device),
++            "frm": torch.full((length,), -1, dtype=torch.int32, device=device),
++            "lim": torch.zeros((), dtype=torch.int32, device=device),
++        }
++        _MASK_BUFFERS[key] = buf
++    return buf
++
++
++def _build_action_block_masks(ann_rows, v0, fr, latent_t, cu_seqlens, seq_len, device,
++                              n_real=None):
 +    """逐 latent 文本条件的硬绑定掩码。
 +
 +    只做一件事：**让第 k 条标注行与第 k 帧以外的 video 行互相不可见**。
@@ -101,41 +145,61 @@ index 2a4684e..3092d53 100644
 +    自注意力对 token 是置换等变的，光把 37 条标注塞进序列，模型无从知道哪条对哪帧；
 +    位置（镜像偏移）只提供软偏置，这个掩码才是架构级的保证。
 +
++    第二件事是 padding：packed 会把有效长度补到全数据集统一值（否则 flex_attention 每
++    换一个序列长度就重编译一次），这里必须把 pad 行屏蔽掉 —— 那些行是零向量，不屏蔽
++    会参与 softmax、改变分母。pad 行只允许看自己，否则整行没有可见 key，softmax 出 NaN。
++
 +    ann_rows: [latent_t, 2]，每条标注在序列里的 (起, 止) 绝对行号。
++    n_real:   padding 之前的真实长度；None 表示没有 padding。
 +    """
 +    from torch.nn.attention.flex_attention import create_block_mask
-+
-+    ann_of = torch.full((seq_len,), -1, dtype=torch.int32, device=device)
-+    for k in range(latent_t):
-+        lo, hi = int(ann_rows[k, 0]), int(ann_rows[k, 1])
-+        if hi > lo:
-+            ann_of[lo:hi] = k
-+    frm_of = torch.full((seq_len,), -1, dtype=torch.int32, device=device)
-+    span = torch.arange(v0, v0 + latent_t * fr, device=device)
-+    frm_of[span] = ((span - v0) // fr).to(torch.int32)
 +
 +    masks = {}
 +    bounds = cu_seqlens.tolist()
 +    for start, stop in zip(bounds[:-1], bounds[1:]):
-+        if stop == start:
++        length = stop - start
++        if length <= 0:
 +            continue
-+        a, f = ann_of[start:stop], frm_of[start:stop]
-+        if not bool((a >= 0).any()) or not bool((f >= 0).any()):
-+            continue                      # 这一段里没有标注或没有 video，不必掩码
-+        def mask_mod(b, h, q, kv, a=a, f=f):
-+            aq, akv, fq, fkv = a[q], a[kv], f[q], f[kv]
++        local_real = length if n_real is None else max(0, min(int(n_real) - start, length))
++        has_pad = local_real < length
++        buf = _mask_buffers(device, start, length)
++        ann, frm, lim = buf["ann"], buf["frm"], buf["lim"]
++        ann.fill_(-1)
++        frm.fill_(-1)
++        lim.fill_(local_real)
++
++        any_ann = False
++        for k in range(latent_t):
++            lo, hi = int(ann_rows[k, 0]) - start, int(ann_rows[k, 1]) - start
++            lo, hi = max(lo, 0), min(hi, length)
++            if hi > lo:
++                ann[lo:hi] = k
++                any_ann = True
++        vlo, vhi = v0 - start, v0 + latent_t * fr - start
++        if vhi > 0 and vlo < length:
++            lo, hi = max(vlo, 0), min(vhi, length)
++            idx = torch.arange(lo, hi, device=device)
++            frm[lo:hi] = ((idx + start - v0) // fr).to(torch.int32)
++        any_frm = bool(vhi > 0 and vlo < length)
++
++        if not (any_ann and any_frm) and not has_pad:
++            continue                      # 这一段既没有绑定要做，也没有 pad 要屏蔽
++
++        def mask_mod(b, h, q, kv, ann=ann, frm=frm, lim=lim):
++            aq, akv, fq, fkv = ann[q], ann[kv], frm[q], frm[kv]
 +            blocked = (((aq >= 0) & (fkv >= 0) & (aq != fkv))
 +                       | ((fq >= 0) & (akv >= 0) & (fq != akv)))
-+            return ~blocked
-+        n = stop - start
-+        masks[start] = create_block_mask(mask_mod, None, None, n, n, device=device)
++            real = (q < lim) & (kv < lim)
++            return (q == kv) | (real & ~blocked)
++
++        masks[start] = create_block_mask(mask_mod, None, None, length, length, device=device)
 +    return masks
 +
 +
  class MiniMaxH3Rope(nn.Module):
      def __init__(self, inv_freq_len: int) -> None:
          super().__init__()
-@@ -133,7 +201,7 @@ class MiniMaxH3Attention(nn.Module):
+@@ -133,7 +245,7 @@ class MiniMaxH3Attention(nn.Module):
          self.k_norm = _norm(attention_head_dim, eps=qk_norm_eps)
          self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
  
@@ -144,7 +208,7 @@ index 2a4684e..3092d53 100644
          total = x.shape[0]
          qkv = self.qkv_proj(x)
          qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
-@@ -145,7 +213,8 @@ class MiniMaxH3Attention(nn.Module):
+@@ -145,7 +257,8 @@ class MiniMaxH3Attention(nn.Module):
          if rope_freqs is not None:
              q = _apply_rope(q, rope_freqs)
              k = _apply_rope(k, rope_freqs)
@@ -154,7 +218,7 @@ index 2a4684e..3092d53 100644
          out = out.reshape(total, self.num_heads * self.head_dim)
          return self.out_proj(out)
  
-@@ -220,12 +289,19 @@ class MiniMaxH3DiTBlock(nn.Module):
+@@ -220,12 +333,19 @@ class MiniMaxH3DiTBlock(nn.Module):
          self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
          self.adaln_proj = MiniMaxH3AdalnProj(hidden_size, time_embed_dim, adaln_out_features, expand_ratio=6, modality_num=MINIMAX_H3_ADALN_MODALITY_NUM)
  
@@ -176,7 +240,7 @@ index 2a4684e..3092d53 100644
          x = _modulate_gate(residual, gate_msa, h, combined_indices)
          residual = x
          h = self.norm2(x)
-@@ -282,6 +358,9 @@ class MiniMaxH3DiT(nn.Module):
+@@ -282,6 +402,9 @@ class MiniMaxH3DiT(nn.Module):
          self.hidden_size = hidden_size
          self.num_attention_heads = num_attention_heads
          self.num_channels_latents = latents_dim
@@ -186,7 +250,7 @@ index 2a4684e..3092d53 100644
          video_patch_dim = latents_dim * patch_size[0] * patch_size[1] * patch_size[2]
  
          self.video_patch_proj = nn.Linear(video_patch_dim, hidden_size, bias=True)
-@@ -298,6 +377,51 @@ class MiniMaxH3DiT(nn.Module):
+@@ -298,6 +421,51 @@ class MiniMaxH3DiT(nn.Module):
          )
          self.final_layer = MiniMaxH3FinalLayer(hidden_size, time_embed_dim, final_adaln_out_features, latents_dim, audio_latents_dim, patch_size, final_norm_eps)
  
@@ -238,7 +302,7 @@ index 2a4684e..3092d53 100644
      def _embed(self, *, x, audio_x, text_embeddings_selected, unique_timesteps, img_pos, audio_pos, text_pos, refiner_cu_seqlens, refiner_max_seqlen, seq_len, device):
          dtype = text_embeddings_selected.dtype
          x_rows = x.view(-1, x.shape[-1]).index_select(0, img_pos).to(dtype)
-@@ -336,6 +460,10 @@ class MiniMaxH3DiT(nn.Module):
+@@ -336,6 +504,11 @@ class MiniMaxH3DiT(nn.Module):
          use_gradient_checkpointing_offload=False,
          update_audio_mask=None,
          skip_mask_out_condition=False,
@@ -246,10 +310,11 @@ index 2a4684e..3092d53 100644
 +        action_video_start=None,
 +        action_frame_rows=None,
 +        action_text_rows=None,
++        action_real_used=None,
      ) -> tuple[torch.Tensor, torch.Tensor]:
          inverse_indices = inverse_indices.view(-1).to(torch.long)
          token_tags = token_tags.view(-1).to(torch.long)
-@@ -371,7 +499,46 @@ class MiniMaxH3DiT(nn.Module):
+@@ -371,7 +544,47 @@ class MiniMaxH3DiT(nn.Module):
  
          hidden = decoder_input
          cu_seqlens = cu_seqlens.to(device)
@@ -275,6 +340,7 @@ index 2a4684e..3092d53 100644
 +            block_masks = _build_action_block_masks(
 +                action_text_rows, int(action_video_start), int(action_frame_rows),
 +                int(action_text_rows.shape[0]), cu_seqlens, hidden.shape[0], hidden.device,
++                n_real=action_real_used,
 +            )
 +
 +        for i, block in enumerate(self.blocks):
@@ -297,7 +363,7 @@ index 2a4684e..3092d53 100644
              hidden = gradient_checkpoint_forward(
                  block,
                  use_gradient_checkpointing,
-@@ -382,6 +549,8 @@ class MiniMaxH3DiT(nn.Module):
+@@ -382,6 +595,8 @@ class MiniMaxH3DiT(nn.Module):
                  rope_freqs=rope_freqs,
                  cu_seqlens=cu_seqlens,
                  max_seqlen=max_seqlen,
@@ -307,10 +373,10 @@ index 2a4684e..3092d53 100644
  
          video_logits, audio_logits = self.final_layer(hidden, t_emb=t_emb, inverse_indices=inverse_indices)
 diff --git a/diffsynth/pipelines/minimax_h3_audio_video.py b/diffsynth/pipelines/minimax_h3_audio_video.py
-index 7f845ef..dd9f822 100644
+index 7f845ef..0d29686 100644
 --- a/diffsynth/pipelines/minimax_h3_audio_video.py
 +++ b/diffsynth/pipelines/minimax_h3_audio_video.py
-@@ -103,6 +103,12 @@ class MiniMaxH3Pipeline(BasePipeline):
+@@ -103,6 +103,15 @@ class MiniMaxH3Pipeline(BasePipeline):
          retake_audio: torch.Tensor = None,
          retake_audio_sample_rate: int = 32000,
          seconds_regions_to_retake: list[tuple[float, float]] = None,
@@ -320,10 +386,13 @@ index 7f845ef..dd9f822 100644
 +        # 这样 cfg_scale 放大的恰好是动作那部分的差量，而不是笼统的 prompt 服从度。
 +        action_script: list = None,
 +        negative_action_script: list = None,
++        # 把有效长度 padding 到固定值，避免 flex_attention 反复重编译。
++        # 训练侧由 inject_abot_text.py 按全数据集算好写进缓存，推理侧应传同一个值。
++        action_pad_used_to: int = None,
          progress_bar_cmd=tqdm,
      ):
          """Generate a joint video + audio sample.
-@@ -127,8 +133,9 @@ class MiniMaxH3Pipeline(BasePipeline):
+@@ -127,8 +136,9 @@ class MiniMaxH3Pipeline(BasePipeline):
          self.scheduler.set_timesteps(num_inference_steps, shift=flow_shift)
          self.scheduler_audio.set_timesteps(num_inference_steps, shift=audio_flow_shift)
  
@@ -335,15 +404,16 @@ index 7f845ef..dd9f822 100644
          inputs_shared = {
              "cfg_scale": cfg_scale,
              "height": height, "width": width, "num_frames": num_frames,
-@@ -141,6 +148,7 @@ class MiniMaxH3Pipeline(BasePipeline):
+@@ -141,6 +151,8 @@ class MiniMaxH3Pipeline(BasePipeline):
              "retake_video": retake_video, "frame_regions_to_retake": frame_regions_to_retake,
              "retake_audio": (retake_audio, retake_audio_sample_rate) if retake_audio is not None else None, "seconds_regions_to_retake": seconds_regions_to_retake,
              "imgvid_cond_noise_aug": self.imgvid_cond_noise_aug, "audio_cond_noise_aug": self.audio_cond_noise_aug,
 +            "action_cond": action_cond,
++            "action_pad_used_to": action_pad_used_to,
          }
  
          # 3. Unit chain
-@@ -208,10 +216,10 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
+@@ -208,10 +220,10 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
      def __init__(self):
          super().__init__(
              seperate_cfg=True,
@@ -357,7 +427,7 @@ index 7f845ef..dd9f822 100644
              onload_model_names=("text_encoder",),
          )
  
-@@ -248,7 +256,27 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
+@@ -248,7 +260,27 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
          input_ids, text_token_tags = presentation_ref2va(pipe.tokenizer, prompt, condition_labels, image_counts, video_counts, video_timestamps)
          return input_ids, text_token_tags, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
  
@@ -386,14 +456,13 @@ index 7f845ef..dd9f822 100644
          pipe.load_models_to_device(self.onload_model_names)
          pixel_values = image_grid_thw = pixel_values_videos = video_grid_thw = None
          if ref_blocks:
-@@ -269,8 +297,18 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
+@@ -269,8 +301,18 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
              kwargs["pixel_values_videos"] = pixel_values_videos.to(pipe.device, pipe.torch_dtype)
              kwargs["video_grid_thw"] = video_grid_thw.to(pipe.device, torch.long)
          hidden = pipe.text_encoder(**kwargs)
 +        hidden = hidden.to(pipe.device, pipe.torch_dtype)
 +        tags = text_token_tags.view(-1).to(pipe.device, torch.long)
- 
--        return {"prompt_embeds": hidden.to(pipe.device, pipe.torch_dtype), "text_token_tags": text_token_tags.view(-1).to(pipe.device, torch.long)}
++
 +        spans = None
 +        if action_script:
 +            rows, spans = self._encode_action_script(
@@ -401,33 +470,42 @@ index 7f845ef..dd9f822 100644
 +            hidden = torch.cat([hidden] + rows, dim=0)
 +            extra = sum(int(r.shape[0]) for r in rows)
 +            tags = torch.cat([tags, torch.ones(extra, dtype=torch.long, device=tags.device)])
-+
+ 
+-        return {"prompt_embeds": hidden.to(pipe.device, pipe.torch_dtype), "text_token_tags": text_token_tags.view(-1).to(pipe.device, torch.long)}
 +        return {"prompt_embeds": hidden, "text_token_tags": tags, "action_text_spans": spans}
  
  
  class MiniMaxH3Unit_InputVideoEmbedder(PipelineUnit):
-@@ -546,8 +584,10 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
+@@ -546,9 +588,11 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
      def __init__(self):
          super().__init__(
              seperate_cfg=True,
 -            input_params_posi={"prompt_embeds": "prompt_embeds", "text_token_tags": "text_token_tags"},
 -            input_params_nega={"prompt_embeds": "prompt_embeds", "text_token_tags": "text_token_tags"},
+-            input_params=("video_latents", "audio_latents", "keyframe_cond_anchor", "keyframe_indices", "ref_blocks"),
 +            input_params_posi={"prompt_embeds": "prompt_embeds", "text_token_tags": "text_token_tags",
 +                               "action_text_spans": "action_text_spans"},
 +            input_params_nega={"prompt_embeds": "prompt_embeds", "text_token_tags": "text_token_tags",
 +                               "action_text_spans": "action_text_spans"},
-             input_params=("video_latents", "audio_latents", "keyframe_cond_anchor", "keyframe_indices", "ref_blocks"),
++            input_params=("video_latents", "audio_latents", "keyframe_cond_anchor", "keyframe_indices", "ref_blocks", "action_pad_used_to"),
              output_params=("packed",)
          )
-@@ -595,8 +635,16 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
+ 
+@@ -595,14 +639,33 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
          return torch.cat([torch.full((audio_t,), float(w_grid[0]), dtype=torch.float64),
                            torch.full((audio_rows - audio_t,), float(w_grid[-1]), dtype=torch.float64)])
  
 -    def _build_packed_fl2va(self, text_len, latent_t, latent_h, latent_w, audio_t, keyframe_indices, audio_channel=2):
 -        """fl2va layout: [text | cond | audio | video | pad]."""
 +    def _build_packed_fl2va(self, text_len, latent_t, latent_h, latent_w, audio_t,
-+                            keyframe_indices, audio_channel=2, action_text_spans=None):
++                            keyframe_indices, audio_channel=2, action_text_spans=None,
++                            pad_used_to=None):
 +        """fl2va layout: [text | cond | audio | video | pad].
++
++        pad_used_to: 把有效长度 padding 到这个固定值。flex_attention 是 torch.compile 过的，
++        每个不同的序列长度都会触发重编译，而逐条样本的 text_len 不同，几步就会撞满
++        Dynamo 的重编译上限。padding 到全数据集统一值后只需编译一次。
++        多出来的行是零向量，由 DiT 的掩码屏蔽（见 _build_action_block_masks 的 n_real）。
 +
 +        action_text_spans: 逐 latent 文本条件的行区间 [(start, stop), ...]（文本段内偏移）。
 +        给了就把这些行按**镜像偏移**排布：第 k 条放在 t = (text_len - 视频跨度) + s_k，
@@ -438,7 +516,18 @@ index 7f845ef..dd9f822 100644
          frame_rows = (latent_h // 2) * (latent_w // 2)
          video_rows = latent_t * frame_rows
          audio_rows = audio_t * audio_channel
-@@ -617,6 +665,30 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
+         num_keyframes = len(keyframe_indices)
+         cond_rows = num_keyframes * frame_rows
+         used = text_len + cond_rows + audio_rows + video_rows
++        real_used = used
++        if pad_used_to is not None:
++            if pad_used_to < used:
++                raise ValueError(f"pad_used_to {pad_used_to} 小于实际长度 {used}")
++            used = int(pad_used_to)
+         seq_len = self._aligned_seq_len(used)
+ 
+         text_sl = slice(0, text_len)
+@@ -617,6 +680,30 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
          g = torch.zeros(seq_len, 3, dtype=torch.float64)
          g[text_sl, 0] = torch.arange(text_len, dtype=torch.float64)
  
@@ -469,7 +558,7 @@ index 7f845ef..dd9f822 100644
          sqrt_area = np.sqrt(latent_h * latent_w)
          frame, w_grid = self._frame_grid(latent_h, latent_w, sqrt_area)
  
-@@ -642,11 +714,16 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
+@@ -642,11 +729,17 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
          token_tags[audio_sl] = 2
          token_tags[img_pos] = 0  # both cond and video rows are tagged as video (0)
  
@@ -483,16 +572,17 @@ index 7f845ef..dd9f822 100644
 +            out["action_text_rows"] = action_text_rows
 +            out["action_video_start"] = video_sl.start
 +            out["action_frame_rows"] = frame_rows
++            out["action_real_used"] = real_used
 +        return out
  
      def _build_packed_ref2va(self, text_len, latent_t, latent_h, latent_w, audio_t, ref_blocks, audio_channel=2):
          """ref2va layout: [text | ref_0 | ref_1 | ... | target_audio | target_video | pad]"""
-@@ -775,14 +852,17 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
+@@ -775,14 +868,17 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
              "seq_len": seq_len,
          }
  
 -    def process(self, pipe: MiniMaxH3Pipeline, prompt_embeds, video_latents, audio_latents, text_token_tags=None, keyframe_cond_anchor=None, keyframe_indices=None, ref_blocks=None):
-+    def process(self, pipe: MiniMaxH3Pipeline, prompt_embeds, video_latents, audio_latents, text_token_tags=None, keyframe_cond_anchor=None, keyframe_indices=None, ref_blocks=None, action_text_spans=None):
++    def process(self, pipe: MiniMaxH3Pipeline, prompt_embeds, video_latents, audio_latents, text_token_tags=None, keyframe_cond_anchor=None, keyframe_indices=None, ref_blocks=None, action_text_spans=None, action_pad_used_to=None):
          text_len = prompt_embeds.shape[0]
          video_latent_t, latent_h, latent_w = video_latents.shape[2:]
          audio_latent_t = audio_latents.shape[-1]
@@ -503,11 +593,11 @@ index 7f845ef..dd9f822 100644
 +            packed = self._build_packed_fl2va(
 +                text_len, video_latent_t, latent_h, latent_w, audio_latent_t,
 +                keyframe_indices if keyframe_cond_anchor is not None else [],
-+                action_text_spans=action_text_spans)
++                action_text_spans=action_text_spans, pad_used_to=action_pad_used_to)
  
          packed["token_tags"][packed["text_pos"]] = text_token_tags.cpu()
          if pipe.device == "mps":
-@@ -809,8 +889,13 @@ def model_fn_minimax_h3(
+@@ -809,8 +905,13 @@ def model_fn_minimax_h3(
      audio_cond_noise_aug=1.0,
      use_gradient_checkpointing=False,
      use_gradient_checkpointing_offload=False,
@@ -521,7 +611,7 @@ index 7f845ef..dd9f822 100644
      t_video = 1.0 - float(timestep_video) / 1000
      t_audio = 1.0 - float(timestep_audio) / 1000
  
-@@ -874,6 +959,15 @@ def model_fn_minimax_h3(
+@@ -874,6 +975,16 @@ def model_fn_minimax_h3(
          skip_mask_out_condition=True,
          use_gradient_checkpointing=use_gradient_checkpointing,
          use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
@@ -534,6 +624,7 @@ index 7f845ef..dd9f822 100644
 +        # 逐 latent 文本条件的行区间。由 _build_packed_fl2va 在打包时算好写进 packed，
 +        # DiT 拿它建硬绑定掩码（标注 k 只与第 k 帧的 video 行互相可见）。
 +        action_text_rows=packed.get("action_text_rows"),
++        action_real_used=packed.get("action_real_used"),
      )
  
      v_video_rows = v_video_rows[cond_rows_count:]

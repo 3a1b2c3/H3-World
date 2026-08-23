@@ -6,6 +6,9 @@
 
 | 文档 | 内容 |
 |---|---|
+| [`action_injection_arch.html`](action_injection_arch.html) | **架构图**。按键怎么变成逐 latent 文本、序列版面与硬绑定掩码、与两次失败方案的结构差异 |
+| [`longer_video.md`](longer_video.md) | **能不能生成更长的视频**。当前 5.2s 是怎么来的、架构支不支持、三条路各自的代价与建议顺序 |
+| [`journey.md`](journey.md) | **过程记录**。每次方案怎么定的、撞上什么问题、怎么定位、怎么修 —— 包括两次失败的诊断、几个静默 bug、判据本身的演进 |
 | [`pipeline_text_injection.md`](pipeline_text_injection.md) | **管线状态**。方案要点、版面与绑定、代码改动清单、全部验证结果、怎么跑、未完成项 |
 | [`action_text_injection_plan.html`](action_text_injection_plan.html) | **方案定稿**。为什么是这个方案、信号设计、注入设计、H3 家底对照、流式约束、风险 |
 | [`action_prompt_viz.html`](action_prompt_viz.html) | **标注核对台**。8 条片段，播放时按键与标注同步高亮；页尾是 9 位按键 → 文本的映射表 |
@@ -45,9 +48,38 @@
 
 **想知道现在做什么** → `pipeline_text_injection.md`
 
+**想知道这一路是怎么走过来的** → `journey.md`
+
 **想知道为什么这么做** → `action_text_injection_plan.html` → 若想看被否掉的方案，
 再翻 `injection_options.html`
 
 **想知道之前为什么失败** → `PROGRESS.md` 的 §4（失效诊断）与 `action_injection_design.md`
 
 **想动手复现** → 仓库根目录 `README.md` 的「复现」一节 + `workspace_layout.md` 的环境部分
+
+---
+
+## 可视化页（在线版）
+
+三个核对台内嵌了视频（每个 3–6 MB），**不入库** —— 它们是 `code/abot/build_*_viz.py`
+的生成物，每重建一次就会往 git 历史里塞一个全新的大 blob。在线版：
+
+| 页面 | 比什么 | 链接 |
+|---|---|---|
+| 推理结果核对台 | 生成 vs 真实片段 | https://claude.ai/code/artifact/e281885a-2132-46ba-8dc0-9617db13b66b |
+| 换按键对照台 | 生成 vs 另一个生成（同首帧换按键） | https://claude.ai/code/artifact/e84b3ed3-37aa-42b7-81ab-02a536bc2d8a |
+| 架构图 | 注入机制（纯 SVG，已入库） | https://claude.ai/code/artifact/417e81bd-93c8-4a6b-a899-c796d424b737 |
+
+重建方式：
+
+```bash
+# 推理结果核对台（跑完 8 卡推理会自动生成）
+bash code/abot/run_infer8_text.sh 0 1 2 3 4 5 6 7
+
+# 换按键对照台
+bash code/abot/run_action_ab8.sh
+python3 code/abot/build_action_ab_viz.py --tag ab8_step9840
+
+# 每次改完页面都要过这一关（假 DOM 下真跑一遍 script）
+python3 code/abot/check_page_js.py docs/<页面>.html
+```

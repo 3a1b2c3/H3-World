@@ -27,5 +27,12 @@ __pycache__/
 *.orig
 .DS_Store
 
-# 可视化页是生成物（内嵌视频，6 MB）。要入库就把下面这行注释掉。
-# docs/action_prompt_viz.html
+# ── 可视化页：内嵌视频的不入库 ────────────────────────────────
+# 这几页每个 3–6 MB，内容是 base64 的 mp4。它们是**生成物**，而且每重建一次
+# 就往 git 历史里塞一个全新的 5 MB blob，很快就会把仓库撑坏。
+# 生成它们的脚本在 code/abot/build_*_viz.py，产出也发布成了 Artifact（见 docs/README.md）。
+docs/action_prompt_viz.html
+docs/action_prompt_text_viz.html
+docs/action_ab_viz.html
+# 例外：架构图页是纯 SVG、35 KB、无外部依赖，入库。
+!docs/action_injection_arch.html
