@@ -1,183 +1,287 @@
-# minimax_finetune
+# Action-Controllable World Model on MiniMax-H3
 
-给 **MiniMax-H3**（音视频联合的视频扩散 Transformer）加上**动作可控**：给定首帧和一段
-按键序列，生成出符合指令的视频。最终目标是流式续写 + 动作可控的世界模型。
+Turn keyboard input into video: the same first frame plus a different key sequence
+should produce a different — and *correct* — motion. Built by fine-tuning
+[MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3) on
+[ABot-World-Explorer-500h](https://huggingface.co/datasets) gameplay footage.
 
-数据是第三人称开放世界游戏录像（ABot-World-Explorer），8000 条 124 帧 @24fps / 832×480
-的切片，配套逐帧按键与 COLMAP 反推的相机位姿。
+The condition path adds **zero trainable parameters**. Key presses become one
+short English sentence per latent frame, injected through the text channel the
+model was already pretrained on, and bound to the right frame by an attention mask.
 
----
+## 🎬 Demo
 
-## 现在的方案：逐 latent 动作文本注入
+[![demo reel](docs/assets/demo_poster.jpg)](docs/assets/demo.mp4)
 
-条件不走特征空间，走 **H3 预训练过的文本通路**：每个 latent 一条结构化文本，
-由 **9 位按键的纯函数**生成，训练与推理走完全同一条路径。
+**[▶ Watch the 40 s reel](docs/assets/demo.mp4)** — three chapters, each with the
+driving action prompt on screen:
 
-```
-头部（原样保留）  <Picture 1>: [首帧视觉 392 行] + 场景描述
-逐 latent（37 条） the man <怎么动>, camera <相机视角怎么动>
-```
+1. **Generated vs ground truth** — the clip's own recorded keys
+2. **Same first frame, four action prompts** — identical seed and scene, only the keys differ
+3. **Longer videos** — one-shot 10.1 s and chunked 15.5 s
 
-三个要点：
+## 📋 Contents
 
-- **条件通路零新增可训练参数** —— 「按键 → 文本」是手写规则表，「文本 → 嵌入」是冻结的
-  文本编码器。前两次失败的病灶（动作层权重梯度互相抵消）在这条路上不存在。
-- **硬绑定靠掩码，不靠位置** —— 自注意力对 token 置换等变，光把 37 条标注塞进序列，
-  模型无从知道哪条对哪帧。`score_mod` 让标注行 k 与第 k 帧以外的 video 行互相不可见。
-- **第 9 位 `F`(fast) 从 COLMAP 实测速率合成** —— 方向能从 IJKL 读出（命中率 0.85–0.97），
-  速度读不出来（按 J 的步 slowly/sharply 是 0.66/0.34，接近抛硬币）。这一位是整个方案里
-  唯一真正超出原始 8 bit 的信息。
+- [How it works](#-how-it-works)
+- [Results](#-results)
+- [Installation](#️-installation)
+- [Quick start](#-quick-start)
+- [Training](#-training)
+- [Repository layout](#-repository-layout)
+- [Docs](#-docs)
 
-完整设计与推导：[`docs/action_text_injection_plan.html`](docs/action_text_injection_plan.html) ·
-管线状态与实测：[`docs/pipeline_text_injection.md`](docs/pipeline_text_injection.md) ·
-过程记录（问题与修法）：[`docs/journey.md`](docs/journey.md) ·
-文档索引：[`docs/README.md`](docs/README.md)
+## 🧩 How it works
 
-### 走到这一步之前失败的两次
+### Keys → sentence → sequence
 
-| 方案 | 注入点 | 调制量级 | ΔW·W 余弦 | 结论 |
-|---|---|---:|---:|---|
-| 加性 bias | block 入口 | 0.107% @2952 步 | +0.064 | 失效 |
-| FiLM | AdaLN 之后 | 0.33% @3000 步 | +0.047 | 失效 |
-
-FiLM 修好了加性 bias 的表达能力缺陷、量级涨了 3 倍，但方向余弦反而更低。
-换机制没用，说明问题在**信号本身**而不是注入形式——这是转向文本注入的直接原因。
-20 种注入方式的横向评估见 [`docs/injection_options.html`](docs/injection_options.html)。
-
-### 零训练探针的结论
-
-基座模型（不训练）同首帧同 seed，只改 prompt 尾句，用相位相关估全局水平位移
-（符号已标定：`cum_dx` 与 `Σd_yaw` 相关系数 **r = −0.936**，14/14 反号）：
-
-| 样本 | left − right | 像素 MAE | 判定 |
-|---|---:|---:|---|
-| `a3ad9c24` | −116 | 43.26 | 强 |
-| `33b38f0f` | −4 | 13.56 | 空 |
-| `2c75323e` | −116 | 50.22 | 强 |
-
-**2/3 强阳性** —— H3 的文本通道本来就握着相机运动的控制权。且**动作零参考负 prompt**
-把弱方向放大约 9 倍（用空负 prompt 的 CFG 反而更差）。
-
----
-
-## 仓库里有什么
+Each clip is 124 frames at 24 fps (5.2 s). The video VAE compresses it to **37
+latent frames**, so the action track is pooled into 37 steps and each step gets one
+sentence from a fixed template:
 
 ```
-code/
-  abot/                     当前这条线
-    abot_action.py            动作 schema：COLMAP 解析、分箱到 latent 时间轴
-    action_script.py          规则表：9 位按键 -> 结构化标注（纯函数）
-    build_abot_clips.py       从源视频切片 + 逐帧动作
-    split_abot_metadata.py    训练/测试划分
-    inject_abot_text.py       ★ 数据构建：重写 prompt_embeds + packed
-    verify_text_cache.py      ★ 缓存完整性校验（六条判据，支持分片）
-    infer_abot.py             推理（文本注入 / 旧的动作张量两种模式）
-    probe_action_mask.py      ★ 掩码落点探针（改 DiT 后必跑）
-    probe_text_channel.py     零训练探针：文本通道控不控运动
-    analyze_probe.py          探针判据：相位相关估全局平移
-    build_action_viz.py       标注核对台（标注 vs GT，验数据）
-    build_text_infer_viz.py   ★ 推理结果核对台（生成 vs GT，验模型）
-    build_action_ab_viz.py    ★ 换按键对照台（生成 vs 另一个生成）+ 位移测量
-    build_compare_page.py     GT / Generated 横版对比页
-    merge_runs.py             多卡各出一条时，合并成一个结果目录
-    viz_action.py             动作 HUD 渲染
-    check_page_js.py          可视化页的运行时检查（假 DOM 跑 script）
-    inject_abot_action.py     旧路径：动作张量注入（ACTION_MODE=cond，仅供对照）
-    compare_action_ckpt.py    旧判据：动作层权重差分（对新方案失效）
-    check_action_grad.py      旧探针：动作层梯度是否流动
-    run_infer8_text.sh        ★ 8 卡并行推理，跑完自动出核对页
-    run_action_ab8.sh         同首帧换按键的 8 卡对照实验
-    run_chunked_continue.sh   分块续写：上一段尾帧当下一段首帧
-  scripts/
-    ABot-FL2VA.sh           训练入口（两阶段：缓存 latent -> 训 LoRA）
-    run_text_pipeline.sh    ★ 一条命令：探针 -> 数据构建 -> 校验 -> 起训
-  vrising/                  前一阶段（V-Rising 数据）的脚本，保留备查
-  diffsynth_h3_action.patch DiffSynth 框架的全部改动（6 文件 714 行）
-  diffsynth_base_commit.txt 补丁对应的 base commit
-docs/                       见 docs/README.md
-env.sh                      环境变量
+the man <how he moves>, camera <how the view moves>
 ```
 
-**不在仓库里**（见 `.gitignore`）：框架与 134 GB 权重、91 GB 视频切片、
-357 GB latent 缓存与 checkpoint、运行时缓存与日志，以及**内嵌视频的可视化页**
-（3–6 MB/个，是生成物；在线版链接见 `docs/README.md`）。
-唯一入库的页面是 `docs/action_injection_arch.html` —— 纯 SVG，35 KB，无外部依赖。
+Both slots are a **pure function of 9 bits** — the 8 recorded keys `W A S D I J K L`
+plus one synthesized `F` (fast) bit. 60 distinct sentences cover the whole dataset.
+Because it is a pure function, training and inference run the exact same code path;
+there is no representation to keep in sync.
 
----
+The 9th bit matters: direction is readable from the keys, **speed is not**. Across
+600 clips, `slowly`/`sharply` splits 0.66/0.34 on steps where `J` is held — close to
+a coin flip. So `F` is synthesized from the camera rotation rate that COLMAP recovers
+from the raw episode, and it is the only information that genuinely exceeds the
+original 8 bits.
 
-## 复现
+### Where the sentences go
+
+H3 has no cross-attention; its text already lives in the same self-attention
+sequence as the video. So the 37 sentences are simply more text rows:
+
+```
+[ text head 566 | 37 sentences 451 | cond 390 | audio 414 | video 37x390 = 14430 | pad 197 ]
+                                                                        total 16448
+```
+
+Self-attention is permutation-equivariant, so position alone cannot tell the model
+which sentence belongs to which frame. A **hard mask** does: sentence *k* and video
+frame *k* see each other, sentence *k* and every other video frame do not. Everything
+else — video↔video, sentence↔sentence, sentence↔first-frame condition — is untouched,
+so removing the sentence rows recovers the original model exactly.
+
+Only a LoRA on `qkv_proj` / `out_proj` is trained (rank 32, 104 modules, 65.6M
+parameters). The condition path itself has no new weights.
+
+### Why 37 latents, and why 17
+
+The video VAE is **causal in time** with 4x temporal compression, and encodes in
+independent 17-frame clips. Causality is what makes image-to-video work — one image
+must map to exactly one latent — and it is why each clip's first output only sees a
+single real frame. That gives the frame grouping `1,4,4,4,4` per clip:
+
+```
+124 frames -> pad to 136 by repeating the last frame -> 8 clips x 17
+           -> each clip encodes independently to 5 latents = 40
+           -> token_drop removes the last 3          -> 37 latents
+```
+
+Hence `num_frames` must be `17k + 5`: 124 (5.2 s), 243 (10.1 s), 481 (20.0 s).
+
+Full diagrams: [action_injection_arch.html](docs/action_injection_arch.html).
+
+## 📊 Results
+
+**Action control works.** Same first frame, same seed, only the keys change.
+Horizontal camera drift measured by phase correlation (sign calibrated on the test
+split: negative = camera pans left):
+
+| Action prompt | Drift vs `still` | |
+|---|---:|---|
+| `camera pans left slowly` | −39 | left ✓ |
+| `strafes left` | −12 | left ✓ |
+| `stands still` | 0 | baseline |
+| `walks forward` | 0 | no pan ✓ |
+| `strafes right` | +8 | right ✓ |
+| `camera pans right slowly` | +31 | right ✓ |
+| `camera pans right sharply` | **+251** | right, **8x stronger** ✓ |
+
+Directions are all correct, the ordering is monotone, and the `F` speed bit produces
+an 8x amplitude change. Nothing moves horizontally when the prompt says nothing should.
+
+**Longer videos work without retraining.** Two routes, both measured by frame-to-frame
+change (coefficient of variation; lower is steadier):
+
+| Route | Length | CV | Failure mode |
+|---|---|---:|---|
+| Raise `num_frames` | 10.1 s | 0.944 | no collapse, but hard cuts mid-clip |
+| Chunked continuation | 15.5 s | 0.463 | steady, but motion stalls at seams (0.46x) |
+
+Details: [longer_video.md](docs/longer_video.md).
+
+> **What is not yet proven.** These measure *global* responsiveness — that the model
+> reacts to the action text. They do not prove *per-frame binding* (that sentence *k*
+> controls frame *k*). The criterion for that is "change only sentence *k*, measure
+> which frames move", and that tool is not written yet.
+
+## 🛠️ Installation
+
+Tested on 8x H200 (141 GB each), CUDA 12.8.
 
 ```bash
-# 1. 框架：checkout 到 base commit 再打补丁
-git clone <DiffSynth-Studio> DiffSynth-Studio-h3
+# 1. environment
+conda create -n minimax_h3 python=3.10 -y
+conda activate minimax_h3
+pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements.txt
+
+# 2. framework — pin the base commit, then apply our patch
+git clone https://github.com/modelscope/DiffSynth-Studio.git DiffSynth-Studio-h3
 git -C DiffSynth-Studio-h3 checkout $(cat code/diffsynth_base_commit.txt)
 git -C DiffSynth-Studio-h3 apply ../code/diffsynth_h3_action.patch
 
-# 2. 权重：MiniMax-H3 FL2VA 放到 DiffSynth-Studio-h3/models/MiniMax/MiniMax-H3/
-#    环境与缓存落盘规则见 docs/workspace_layout.md
+# 3. weights (~135 GB) into DiffSynth-Studio-h3/models/
+python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('MiniMax/MiniMax-H3',
+                  local_dir='DiffSynth-Studio-h3/models/MiniMax/MiniMax-H3')"
 
-# 3. 数据：切片 + metadata
-python3 code/abot/build_abot_clips.py --num-clips 8000
-python3 code/abot/split_abot_metadata.py
-
-# 4. stage 1：缓存 latent（text encoder + video VAE + audio VAE）
-NUM_PROCESSES=8 STAGE=1 bash code/scripts/ABot-FL2VA.sh 7872
-
-# 5. 数据构建：把逐 latent 文本条件写进缓存
-#    视频 latent 不动，换标注方案只需重跑这一步
-python3 code/abot/inject_abot_text.py \
-    --meta data/abot_meta_train_7872.jsonl \
-    --cache output/minimax_h3_abot/7872-cache --dry-run   # 先试算
-python3 code/abot/inject_abot_text.py --meta ... --cache ...   # 再写入
-python3 code/abot/verify_text_cache.py --cache output/minimax_h3_abot/7872-cache
-
-# 6. stage 2：训 LoRA
-NUM_PROCESSES=8 STAGE=2 OUT=output/minimax_h3_abot/7872_text \
-    bash code/scripts/ABot-FL2VA.sh 7872
-
-# 7. 推理（cfg_scale 是动作服从度的放大器，负 prompt 自动用动作零参考）
-python3 code/abot/infer_abot.py --checkpoint <ckpt> --cfg-scale 5.0 --num-samples 8
+# 4. point every cache at a big disk (the root volume is small)
+source env.sh
 ```
 
-或者一条命令跑完第 5–6 步（探针 → 数据构建 → 校验 → 起训，每步不过就停）：
+`code/diffsynth_h3_action.patch` is the complete framework diff (6 files). It adds
+the per-latent text rows, the binding mask, and one fix worth calling out: the
+`flex_attention` autotune is disabled, because on H200 one of its candidate kernels
+raises an illegal memory access that poisons the whole CUDA context and kills a random
+rank at step 0. Autotune bought nothing here (75.6 vs 76.1 ms/iter).
+
+## 🚀 Quick start
+
+### Build the dataset
 
 ```bash
+# cut clips + per-frame actions from the raw episodes
+ABOT_SRC_ROOT=/path/to/ABot-World-Explorer-500h \
+  python3 code/abot/build_abot_clips.py --num-clips 20128 --workers 48
+
+# hold out a fixed test split (reuse an existing one when extending the data —
+# a hash split reshuffles when the input set grows and leaks old test samples)
+python3 code/abot/split_abot_metadata.py \
+  --input data/abot_meta_20128.jsonl \
+  --train-output data/abot_meta_train_20000.jsonl \
+  --test-output  data/abot_meta_test_128_20128.jsonl \
+  --fixed-test   data/abot_meta_test_128.jsonl \
+  --clips-dir data/clips
+```
+
+### Inference
+
+```bash
+# 8 GPUs, 8 test samples, builds the review page when it finishes
+bash code/abot/run_infer8_text.sh 0 1 2 3 4 5 6 7
+
+# same first frame, one key preset per GPU
+bash code/abot/run_action_ab8.sh
+
+# a single sample with an explicit action override
+python3 code/abot/infer_abot.py \
+  --checkpoint output/minimax_h3_abot/20000_text/step-2500.safetensors \
+  --sample-id <sample_id> --device cuda:0 \
+  --action-preset pan-right-fast          # or --action-random 0
+
+# longer video: one shot, or chunk-by-chunk
+python3 code/abot/infer_abot.py ... --num-frames 243
+bash code/abot/run_chunked_continue.sh 3
+```
+
+Add `--vram-limit-gib 30 --allow-busy-gpu` to run inference on a GPU that is already
+training. Measured cost: **+14.8 GB** and training slows from 9.48 to 14.32 s/it,
+recovering the moment inference exits.
+
+### Rebuild the demo reel and review pages
+
+```bash
+python3 code/abot/build_demo_video.py      --out docs/assets/demo.mp4
+python3 code/abot/build_text_infer_viz.py  --runs output/abot_inference/step9840_text_gpu*
+python3 code/abot/build_action_ab_viz.py   --tag ab8_step9840
+python3 code/abot/check_page_js.py docs/<page>.html   # run the script under a fake DOM
+```
+
+## 🏋️ Training
+
+One command runs the whole gated pipeline — probe, data build, verification, launch.
+**Every stage stops on failure**, because this scheme fails silently: a wrong mask
+does not raise, it just trains a model that never learns the binding.
+
+```bash
+SUBSET=20000 NUM_EPOCHS=100 SAVE_STEPS=2500 \
+META=data/abot_meta_train_20000.jsonl \
+CACHE=output/minimax_h3_abot/20000_text-cache \
+OUT=output/minimax_h3_abot/20000_text \
 bash code/scripts/run_text_pipeline.sh
 ```
 
-改动 DiT 之后**必须**先跑掩码探针，六条判据全过才继续。其中第 6 条
-（连续多个不同掩码全部正确）抓的是静默数据损坏，见 `docs/journey.md` §6：
+| Stage | What it checks |
+|---|---|
+| 0 · preflight | cache entry count == metadata rows, GPUs idle |
+| 1 · mask probe | 6 assertions, including *five consecutive different masks all correct* |
+| 2 · data build | 8-way shard; scans the dataset for one uniform padding length |
+| 3 · verification | 8 assertions on every entry; `seq_len` must be unique, mirror offset a single negative constant |
+| 4 · launch | starts training, waits 3 minutes, confirms it is alive |
 
-```bash
-python3 code/abot/probe_action_mask.py
+Latents must be cached first (`STAGE=1`); on 8 GPUs that is ~4.5 h for 20k clips
+and ~0.17 TB.
+
+Reference run: 7872 clips x 10 epochs = 9840 steps, 9.49 s/it, 25 h 54 m on 8x H200,
+zero errors.
+
+## 📁 Repository layout
+
+```
+code/abot/
+  build_abot_clips.py        raw episodes -> clips + per-frame actions
+  split_abot_metadata.py     train/test split (--fixed-test when extending data)
+  abot_action.py             action matrix, latent binning
+  action_script.py           the 9-bit -> sentence rule table
+  inject_abot_text.py        rewrite prompt_embeds + packed in the latent cache
+  verify_text_cache.py       8 assertions over every cache entry
+  probe_action_mask.py       6 assertions on the mask (run after touching the DiT)
+  infer_abot.py              inference, action overrides, arbitrary first frame
+  run_infer8_text.sh         8-GPU inference -> review page
+  run_action_ab8.sh          same first frame, one key preset per GPU
+  run_chunked_continue.sh    chunked continuation for long videos
+  build_*_viz.py             the review pages
+  build_demo_video.py        the demo reel
+  check_page_js.py           run a page's script under a fake DOM
+  analyze_probe.py           phase-correlation drift metric
+  probe_text_channel.py      zero-training probe: does the text channel move the camera
+  run_probe.sh               driver for the above
+  viz_action.py              raw-data HUD, for eyeballing frame/action alignment
+  merge_runs.py              merge per-GPU inference runs into one directory
+code/scripts/
+  ABot-FL2VA.sh              two-stage entry point (cache latents -> train LoRA)
+  run_text_pipeline.sh       probe -> build -> verify -> launch, gated
+code/diffsynth_h3_action.patch    the full framework diff (6 files)
+docs/                              see docs/README.md
+env.sh                             cache paths (keep them off the root volume)
 ```
 
----
+Not in the repository: the framework and its 134 GB of weights, 91 GB of clips,
+357 GB of latent caches and checkpoints, and the review pages that embed video
+(3–6 MB each, regenerated by `build_*_viz.py`). The only page committed is the
+architecture diagram — pure SVG, 36 KB.
 
-## 实测数字
+## 📚 Docs
 
-| | |
+| Document | What it covers |
 |---|---|
-| 标注词表 | 60 种 = 9 移动从句 × 16 相机从句的实际共现，单条 clip 平均 5.0 种 |
-| 数据构建 | 7872 条，8 卡分片约 10 分钟；全量校验 7872/7872 通过 |
-| 序列长度 | `seq_len` 15744–15872 → 16064–16448（均值 16237，+5.4%） |
-| 镜像偏移 | 标注与自己那帧的 t 偏移恒为 **−201**，7872 条全同 |
-| 掩码构建 | 16k 序列上 12.3 ms/forward，50 层共用，占训练步 0.12% |
-| 掩码代价 | 注意力从 flash 切到 FlexAttention，**慢 23%**（2.41 → 2.97 s/it） |
-| 掩码正确性 | 闭包必须闭在持久缓冲区上，否则第二条样本起全用第一条的掩码且不报错 |
+| [action_injection_arch.html](docs/action_injection_arch.html) | Architecture diagrams: keys → text, sequence layout, binding mask |
+| [journey.md](docs/journey.md) | How this was actually built — two failed approaches, the silent bugs, how the criteria evolved |
+| [longer_video.md](docs/longer_video.md) | Generating beyond 5.2 s: three routes and what each costs |
+| [pipeline_text_injection.md](docs/pipeline_text_injection.md) | The current scheme, end to end |
 
-硬件：8 × H200（143.7 GB）。
+## 🙏 Acknowledgements
 
----
-
-## 状态
-
-- [x] 方案设计与横向评估
-- [x] 零训练探针（文本通道确实控运动）
-- [x] 规则表 + 9 位按键表示
-- [x] 掩码 + 版面改造，落点探针 4/4
-- [x] 数据构建 + 全量校验
-- [x] 推理侧接线 + 端到端冒烟（cfg=1 / cfg=5 均通过）
-- [ ] 正式训练
-- [ ] 新判据工具（只改第 k 条标注，看输出哪些帧变了）
-- [ ] 流式续写（块因果掩码 + KV cache + 少步蒸馏）
+[MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3) for the base model,
+[DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) for the training
+framework, and ABot-World-Explorer for the gameplay data.

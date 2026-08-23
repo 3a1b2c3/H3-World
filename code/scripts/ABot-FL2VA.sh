@@ -127,10 +127,11 @@ case "$ACTION_MODE" in
     echo "== 逐 latent 文本条件注入完成 =="
     ;;
   cond)
-    python3 "$PROJECT_ROOT/code/abot/inject_abot_action.py" \
-      --meta "$META" --cache "${OUT}-cache" \
-      "${INJECT_COMPLETENESS_ARGS[@]}" "${ACTION_INJECT_ARGS[@]}"
-    echo "== 动作张量注入完成: dim=$ACTION_BUTTONS =="
+    # 旧的特征空间注入（加性 bias / FiLM）。两次都实测失效，脚本不随仓库发布，
+    # 诊断数字见 docs/journey.md 第一节。
+    echo "ACTION_MODE=cond 是已废弃的对照路径，脚本不在本仓库中。" >&2
+    echo "失效原因与诊断数字见 docs/journey.md 第一节。" >&2
+    exit 1
     ;;
 esac
 fi

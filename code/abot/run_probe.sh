@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 零训练文本通道探针：4 变体 × 2 档 cfg_scale，8 卡各一个。
-# 与训练同卡，必须设 --vram-limit-gib，理由见 run_infer8_film.sh。
+# 与训练同卡，必须设 --vram-limit-gib，理由见 legacy/run_infer8_film.sh。
 # 注意 cfg_scale>1 会同时跑正负两侧，单步开销翻倍。
 set -euo pipefail
 VRAM=${VRAM:-30}

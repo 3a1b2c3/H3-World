@@ -93,9 +93,9 @@ td.num{font-family:var(--mono);font-size:12.5px;font-variant-numeric:tabular-num
   <p class="eyebrow">MiniMax-H3 · ABot 世界模型</p>
   <h1>动作文本注入架构</h1>
   <p class="lede">按键怎么变成模型能听懂的条件，条件又怎么绑到具体那一帧上。
-  六张图：<b>数据怎么流</b>、<b>序列长什么样、掩码卡在哪</b>、
+  七张图：<b>数据怎么流</b>、<b>序列长什么样、掩码卡在哪</b>、
   <b>这次和前两次失败的方案差在哪</b>，以及四个容易看不明白的地方 ——
-  <b>124 帧怎么变成 37 个 latent</b>、<b>130×17 是什么</b>、
+  <b>124 帧怎么变成 37 个 latent、因果 padding 起什么作用</b>、<b>130×17 是什么</b>、
   <b>每句标注占几行</b>、<b>390 行怎么来的</b>。数字全部取自真实缓存条目，不是示意。</p>
   <div class="stats">
     <div class="stat"><b>0</b><span>条件通路新增参数</span></div>
@@ -395,6 +395,101 @@ bias 和 FiLM 一个加性一个乘性、机制完全不同，却给出同一个
 早期规则表就在这里栽过 —— 相机通道逐帧求和，1 帧的 bin 只有 4 帧 bin 的四分之一，
 被误判成"相机变慢了"，22% 的步中招。修法是先除以 bin 帧数换算成逐帧速率再判档。</figcaption>
 </figure>
+
+<h3>①b 因果 padding 是干什么的，1,4,4,4,4 从哪来</h3>
+<p class="sub">这些数字全部来自 <code>minimax_h3_video_vae.py</code> 的构造参数，
+一个都不是我们选的：</p>
+<div class="scroll"><table>
+  <thead><tr><th>参数</th><th style="text-align:right">值</th><th>含义</th></tr></thead>
+  <tbody>
+    <tr><td class="nm">time_down</td><td class="num">(1,2,2,1,1,1)</td>
+        <td>时间维两级 stride-2 → <b>压缩 4×</b></td></tr>
+    <tr><td class="nm">space_down</td><td class="num">(2,2,2,2,1,1)</td>
+        <td>空间四级 → <b>16×</b>（所以 480×832 → 30×52）</td></tr>
+    <tr><td class="nm">causal_encoder</td><td class="num">True</td>
+        <td>时间维<b>因果</b>卷积：t 时刻的输出只依赖 t 及之前的帧</td></tr>
+    <tr><td class="nm">clip_length</td><td class="num">17</td>
+        <td>一次编码的片段单位</td></tr>
+    <tr><td class="nm">token_drop</td><td class="num">3</td>
+        <td>整段编码完丢掉末尾 3 个 latent</td></tr>
+  </tbody>
+</table></div>
+
+<div class="note">
+<p><b>因果 padding 换来的是两件事。</b>其一，<b>图生视频成立</b> ——
+喂一张图就得到恰好一个 latent；不因果的话编码单帧需要未来帧，I2V 无从谈起。
+其二，<b>片段之间互不依赖</b> —— 所以编码器才敢把整段切成 17 帧一片、
+<b>各自独立编码再拼接</b>，这也是将来做流式的前提。
+代价就是每个片段的第一个输出没有"过去"可看，只吃到 1 帧真实数据。</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 1000 250" role="img" aria-label="124 帧到 37 个 latent 的真实流程：末尾重复最后一帧补到 136 帧、切成 8 个 17 帧片段、每片独立因果编码成 5 个 latent 共 40 个、再丢掉末尾 3 个得到 37 个">
+  <defs>
+    <marker id="ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">
+    <text x="20" y="24" font-size="12" font-weight="600" fill="var(--ink)">整段：124 帧 → 37 个 latent</text>
+
+    <rect x="20" y="38" width="800" height="26" rx="3" fill="var(--c-video)" opacity=".8"/>
+    <text x="420" y="56" text-anchor="middle" font-size="10.5" fill="#fff">真实 124 帧</text>
+    <rect x="820" y="38" width="78" height="26" rx="3" fill="var(--c-pad)" opacity=".55"/>
+    <text x="859" y="56" text-anchor="middle" font-size="9.5" fill="var(--c-pad)">重复末帧</text>
+    <text x="908" y="56" font-size="10" opacity=".7">= 136</text>
+
+    <text x="20" y="86" font-size="10.5" opacity=".75">① 末尾重复最后一帧补到 17 的倍数（不是在开头补）</text>
+
+    <g>
+      <text x="20" y="112" font-size="10.5" opacity=".75">② 切成 8 个 17 帧片段，每片<tspan font-weight="600" fill="var(--ink)">独立</tspan>因果编码</text>
+      <g fill="none" stroke="currentColor" stroke-width="1.2" opacity=".55">
+        <rect x="20"  y="120" width="106" height="26" rx="3"/><rect x="130" y="120" width="106" height="26" rx="3"/>
+        <rect x="240" y="120" width="106" height="26" rx="3"/><rect x="350" y="120" width="106" height="26" rx="3"/>
+        <rect x="460" y="120" width="106" height="26" rx="3"/><rect x="570" y="120" width="106" height="26" rx="3"/>
+        <rect x="680" y="120" width="106" height="26" rx="3"/>
+      </g>
+      <rect x="790" y="120" width="106" height="26" rx="3" fill="none" stroke="var(--c-pad)" stroke-width="1.2" stroke-dasharray="4 3"/>
+      <text x="73"  y="138" text-anchor="middle" font-size="9.5">片段0</text>
+      <text x="843" y="138" text-anchor="middle" font-size="9.5" fill="var(--c-pad)">片段7</text>
+    </g>
+
+    <text x="20" y="172" font-size="10.5" opacity=".75">③ 每片 17 帧 → 5 个 latent，共 40 个</text>
+    <g>
+      <rect x="20" y="180" width="740" height="24" rx="3" fill="var(--c-ann)" opacity=".85"/>
+      <text x="390" y="197" text-anchor="middle" font-size="10.5" fill="#fff">保留的 37 个 latent</text>
+      <rect x="764" y="180" width="132" height="24" rx="3" fill="var(--bad)" opacity=".55"/>
+      <text x="830" y="197" text-anchor="middle" font-size="9.5" fill="#fff">token_drop 丢 3 个</text>
+    </g>
+    <text x="20" y="224" font-size="10.5" opacity=".75">④ 丢掉的正好是只对应"重复末帧"的那几个 —— 8×5 − 3 = 37</text>
+    <text x="20" y="242" font-size="10.5" fill="var(--accent)">片段内因果卷积没有"过去"可看，所以每片第一个 latent 只吃 1 帧 → (1,4,4,4,4)</text>
+  </g>
+</svg>
+<figcaption><b>为什么偏偏是 17。</b>因果 VAE 要求"第一帧能单独成一个 latent"，
+在 4× 压缩下，满足这个条件的片段长度只能是 <code>1 + 4k</code>。
+取 k=4 就是 <b>17 = 1 + 4×4</b>，正好压成 5 个 latent。
+16 帧会得到 1+4+4+4+3 的畸形分组，21 帧则要 6 个 latent、压缩比划不来。
+这也解释了我们的 <code>num_frames</code> 为什么必须是 <code>17k+5</code>：
+末尾那 5 帧自己也是合法的 <code>1+4</code> 形式，能干净地压成 2 个 latent。</figcaption>
+</figure>
+
+<div class="note bad">
+<p><b>这给动作文本注入留了一个未解的问题。</b>
+每个片段的第一个 latent（k ≡ 0 mod 5，全片共 7 个）结构上是一张<b>静止图</b> ——
+它是片段的外观锚点，几乎不含运动信息，因为运动是帧间量。
+而我们给它的是一句<b>描述运动</b>的话，和其它 latent 一视同仁。三个实测后果：</p>
+<p style="margin-top:10px">
+① <b>速度档系统性偏低</b>：只统计按了 J/L 的步，锚点 latent 的 <code>F=1</code>
+占 0.332，普通 latent 占 0.444，<b>比值 0.747</b>。<br>
+② <b>条件密度失衡</b>：7 个锚点只覆盖 <b>5.6%</b> 的时间轴，却占了 <b>18.9%</b>
+的标注条数 —— 密度是普通帧的 <b>3.4 倍</b>。<br>
+③ <b>周期性偏差</b>：偏差固定落在第 5 的倍数上，模型可能学成"位置 ≡ 0 (mod 5) 就该怎样"，
+而不是真去读那句话 —— 这恰好绕过了整个方案想验证的东西。</p>
+<p style="margin-top:10px"><b>候选修法</b>：让锚点沿用<b>后一个 latent</b> 的标注。
+实测两者的 9 位按键有 <b>85.4%</b> 完全相同，所以只改动 14.6% 的锚点；
+而且 <code>_camera_rate</code> 早就在给窄 bin 借后一个 bin 的相机通道，
+这只是把同一个原则贯彻到整条标注上，不是新加特例。<b>尚未实施。</b></p>
+</div>
 
 <h3>② 按键矩阵 130 × 17 是什么</h3>
 <div class="scroll"><table>

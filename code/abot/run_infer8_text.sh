@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 8 卡并行推理逐 latent 文本注入的 checkpoint，**跑完自动出核对页**。
 #
-# 样本沿用 FiLM 那轮的同 8 条（run_infer8_film.sh），同 seed，方便横向对比。
+# 样本沿用 FiLM 那轮的同 8 条（legacy/run_infer8_film.sh），同 seed，方便横向对比。
 # 训练已结束、8 卡全空时不需要限显存；若要和训练同卡挤着跑，设 VRAM=30。
 #
 # 用法:
