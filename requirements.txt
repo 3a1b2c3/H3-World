@@ -1,4 +1,4 @@
-# Pinned from the working environment on 8x H200 / CUDA 12.8.
+# Pinned from the working environment (CUDA 12.8).
 # torch is installed separately from the cu128 index — see README.
 torchvision==0.25.0
 accelerate==1.14.0

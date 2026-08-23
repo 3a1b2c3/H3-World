@@ -220,12 +220,14 @@ def chapter_quad(items, title, sub):
     return frames
 
 
-def write(frames, out: Path):
+def write(frames, out: Path, crf: int = 28):
+    """crf 28 keeps the reel under 10 MB so it can live in the repo.
+    Lower (better) values blow past that: 23 lands around 20 MB for 56 s."""
     out.parent.mkdir(parents=True, exist_ok=True)
     p = subprocess.Popen(
         [str(FFMPEG), "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
          "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-", "-c:v", "libx264", "-preset", "slow",
-         "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)],
+         "-crf", str(crf), "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)],
         stdin=subprocess.PIPE)
     for im in frames:
         p.stdin.write(im.tobytes())
@@ -237,6 +239,7 @@ def write(frames, out: Path):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=ROOT / "docs/assets/demo.mp4")
+    ap.add_argument("--crf", type=int, default=28)
     args = ap.parse_args()
     frames: list[Image.Image] = []
 
@@ -302,7 +305,7 @@ def main() -> None:
                                marks=(37, 74), note="orange marks = chunk seams")
 
     print(f"  encoding {len(frames)} frames ({len(frames)/FPS:.1f}s) …", flush=True)
-    write(frames, args.out)
+    write(frames, args.out, args.crf)
     print(f"\nwrote {args.out}  ({args.out.stat().st_size / 2**20:.1f} MB, "
           f"{len(frames)/FPS:.1f}s)")
 
