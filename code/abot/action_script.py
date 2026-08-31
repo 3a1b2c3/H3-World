@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""动作 -> 逐 latent 文本标注的规则表。
+"""Rule table mapping actions to per-latent text annotations.
 
-docs/action_text_injection_plan.html「信号设计」一节的实现。手写规则，不过 VLM ——
-确定、可复现、零成本，而且推理时能实时生成（流式阶段的硬要求）。
+Hand-written rules, not a VLM: deterministic, reproducible, zero cost, and
+can be generated in real time at inference (a hard requirement for the
+streaming case).
 
-模板是固定句式，只换槽内容：
+The template is a fixed sentence shape with two slots:
 
-    the man <怎么动>, camera <相机视角怎么动>
+    the man <how he moves>, camera <how the view moves>
 
-**「相机视角怎么动」用 COLMAP 实测的 d_yaw / d_pitch 生成，不用 IJKL 按键。**
-这是整个方案唯一能真正增加信息量的地方：三个从句若全由同样 8 个 bit 推出，
-就只是把 one-hot 换成了英文（正是 Incantation 的 Action-Index 基线在做的事）。
+**The camera clause is generated from COLMAP's measured d_yaw / d_pitch, not
+from the IJKL keys.** This is the one place in the whole scheme that can
+genuinely add information: if all three clauses were derived from the same
+8 bits, this would just be a one-hot encoding spelled out in English (which
+is what an Action-Index baseline does).
 
-阈值来自 7872 训练集前 600 条 clip 的实测分位（池化到 latent 之后）：
+Thresholds come from measured percentiles over the first 600 clips of the
+7872-clip training set (after pooling to the latent grid):
 
-    d_yaw   |v| p50=0.145  p70=0.526  p85=0.945  p95=1.076  (ROT_CLIP 截在 3.0)
+    d_yaw   |v| p50=0.145  p70=0.526  p85=0.945  p95=1.076  (ROT_CLIP caps at 3.0)
     d_pitch |v| p50=0.006  p70=0.020  p85=0.229  p95=0.710
 
-符号约定已由 viz_action.py 实证：J = 左转 -> yaw 为正，L = 右转 -> yaw 为负。
+Sign convention verified empirically: J = turn left -> yaw positive,
+L = turn right -> yaw negative.
 
-自检:
+Self-test:
     python3 code/abot/action_script.py --self-test
 """
 from __future__ import annotations
@@ -33,12 +38,15 @@ import numpy as np
 
 import abot_action as A
 
-# 主体锚点：全局一条，让逐帧标注里的 "the man" 有指代物。
-# 具体长相由首帧的 <Picture 1> 视觉 token 承载，这里只需要一个稳定的指代。
+# Global subject anchor, so "the man" in the per-frame clauses has an
+# antecedent. What he actually looks like is carried by the <Picture 1>
+# visual token in the first frame; this string only needs to give the text
+# a stable referent.
 SUBJECT_ANCHOR = "A third-person view of a man."
 
-# 移动从句。按 W/S/A/D 的固定次序拼接，保证同一组合永远得到同一串
-# —— 这是逐条独立编码 + 去重字典能生效的前提。
+# Motion clauses. Concatenated in a fixed W/S/A/D order so the same key
+# combination always produces the same string -- required for per-sentence
+# encoding plus a dedup dictionary to work.
 MOTION = {
     "W": "walks forward",
     "S": "walks backward",
@@ -48,41 +56,45 @@ MOTION = {
 MOTION_ORDER = ("W", "S", "A", "D")
 MOTION_IDLE = "stands still"
 
-# 相机从句阈值。三档而不是连续值，是因为语言表达不了连续量，
-# 硬要写 "pans left by 0.37" 只会制造词表噪声。
-# 阈值定义在**逐帧速率**上，不是 bin 求和值上。
-# bin_to_latent 对相机通道是逐帧求和，而 _FRAME_PER_TOKEN=(1,4,4,4,4) 的 bin 宽不等，
-# 每第 5 步只覆盖 1 帧、求和值天然只有邻居的 1/4。直接拿求和值判档，会让 8/37 的步
-# 被误判成"相机变慢了"——那是 bin 变窄，不是相机变慢。必须先除以 bin 帧数。
-# 数值沿用原先在 4 帧 bin 上校准好的那套（0.10 / 0.90 / 0.20 / 0.30）÷ 4。
+# Camera clause thresholds. Three bands instead of a continuous value,
+# because language can't express a continuous quantity -- "pans left by
+# 0.37" would just add vocabulary noise.
+# These thresholds are defined on the **per-frame rate**, not the raw
+# summed bin value. bin_to_latent sums the camera channels per bin, and
+# _FRAME_PER_TOKEN=(1,4,4,4,4) has unequal bin widths: every 5th step spans
+# only 1 frame, so its sum is naturally 1/4 of its neighbors'. Thresholding
+# the raw sum would misread 8/37 of the steps as "the camera slowed down"
+# when it's really just a narrower bin. Dividing by the bin's frame count
+# first fixes that. The numbers below reuse the original calibration on
+# 4-frame bins (0.10 / 0.90 / 0.20 / 0.30) divided by 4.
 YAW_MIN, YAW_SHARP = 0.025, 0.225
 PITCH_MIN = 0.05
 TRANS_MIN = 0.075
 
-# ---- 9 键动作表示 ----------------------------------------------------------
-# 原始录像只有 8 个键，第 9 位 F(fast) 是从 COLMAP 实测摇镜速率反推合成的。
-# 这么做的理由：方向能从 IJKL 读出（命中率 0.85-0.97），但**速度读不出来**
-# —— 按 J 的步里 66% slowly / 34% sharply，接近抛硬币；按住时长也给不出档位
-# （第 0 步偏慢只是分箱边界效应，之后就平台了）；ICC≈0.475 说明也不是片段级常量。
-# 丢掉速度档，相机从句就退化成 IJKL 的确定性函数，COLMAP 那 6 个通道白测了，
-# 方案又回到"把 one-hot 换成英文"。多这一个 bit，众数查表准确率 0.700 -> 0.871。
+# ---- 9-bit action representation -------------------------------------------
+# The raw recording only has 8 keys; the 9th bit F (fast) is synthesized
+# from the pan rate COLMAP measures. Reason: direction can be read off IJKL
+# (0.85-0.97 hit rate), but **speed cannot** -- steps with J held split
+# 66% slowly / 34% sharply, close to a coin flip; hold duration doesn't give
+# a clean band either (the slower first step is just a bin-boundary effect,
+# then it plateaus); ICC~=0.475 says it isn't a per-clip constant either.
+# Dropping the speed band would make the camera clause a deterministic
+# function of IJKL alone, wasting the 6 COLMAP channels we measured, and the
+# scheme would degrade back into "one-hot spelled out in English". Adding
+# this one bit raises majority-vote lookup accuracy from 0.700 to 0.871.
 FAST_COL = "F"
 KEYS9 = A.ACTIVE_KEY_COLS + [FAST_COL]
 PAN_KEY = {"J": "left", "L": "right"}
-TILT_KEY = {"I": "tilts down", "K": "tilts up"}   # 实测 K 的 d_pitch 95% 为正、I 95% 为负
+TILT_KEY = {"I": "tilts down", "K": "tilts up"}   # measured: K's d_pitch is 95% positive, I's is 95% negative
 CAMERA_IDLE = "holds steady"
 CAMERA_FOLLOW = "follows him"
 
-FAST_COL = "F"
-KEYS9 = A.ACTIVE_KEY_COLS + [FAST_COL]
-PAN_KEY = {"J": "left", "L": "right"}
-TILT_KEY = {"I": "tilts down", "K": "tilts up"}   # 实测 K 的 d_pitch 95% 为正、I 95% 为负
-CAMERA_IDLE = "holds steady"
-CAMERA_FOLLOW = "follows him"
-
-# 平移方向词。只在"旋转近零且角色没按移动键"时才用 —— 那种情况下相机的平移
-# 是独立于按键的新信息；角色在动时相机平移只是跟随，写成 follows him 即可，
-# 再详细写就是把 WASD 换个说法重复一遍，白白拉长标注和词表。
+# Translation words. Only used when rotation is near zero and the character
+# has no movement key held -- in that case the camera's own translation is
+# new information independent of the keys. When the character is moving,
+# camera translation is just following him, and "follows him" says that
+# without restating WASD in different words, which would only bloat the
+# annotation and the vocabulary.
 TRANS_WORD = {
     "d_x_right": ("drifts right", "drifts left"),
     "d_z_fwd":   ("drifts forward", "drifts back"),
@@ -91,13 +103,19 @@ TRANS_WORD = {
 
 
 def _camera_rate(pooled: np.ndarray, min_frames: int = 4) -> np.ndarray:
-    """把逐帧求和的相机通道换算成逐帧速率，并给窄 bin 借邻居凑够窗口。
+    """Convert the per-bin-summed camera channels into a per-frame rate,
+    borrowing from a neighbor to fill out narrow bins.
 
-    两层偏差都来自 _FRAME_PER_TOKEN=(1,4,4,4,4) 的不等宽分箱：
-      1. 尺度 —— 1 帧 bin 的求和值天然只有 4 帧 bin 的 1/4，直接判档会误判成"变慢了"
-      2. 方差 —— 单帧只覆盖 41 ms，估计更抖，更容易偶然掉到阈值下形成 A-B-A 抖动
-    除以 bin 帧数解决第 1 层；窄于 min_frames 的 bin 与后一个 bin 合并估计解决第 2 层。
-    合并只影响这一步用于**判档**的速率，不改动 pooled 本身。
+    Both corrections come from the unequal bin widths of
+    _FRAME_PER_TOKEN=(1,4,4,4,4):
+      1. Scale -- a 1-frame bin's sum is naturally 1/4 of a 4-frame bin's,
+         so thresholding it directly would misread it as "slowed down".
+      2. Variance -- a single frame only covers 41 ms, so its estimate is
+         noisier and more likely to fall below the threshold by chance,
+         producing A-B-A flicker.
+    Dividing by the bin's frame count fixes (1); merging bins narrower than
+    min_frames with the next bin's estimate fixes (2). The merge only
+    affects the rate used for **thresholding** here, not `pooled` itself.
     """
     spans = np.array([e - s for s, e in A.frame_spans(len(pooled))], dtype=np.float32)
     raw = pooled[:, A.NUM_KEYS:]
@@ -110,29 +128,13 @@ def _camera_rate(pooled: np.ndarray, min_frames: int = 4) -> np.ndarray:
     return rate
 
 
-def _motion_clause(keys: np.ndarray) -> str:
-    """keys: [8] 的 ACTIVE_KEY_COLS 顺序（W A S D I J K L），只看前四个移动键。
-
-    先做对轴净化：bin_to_latent 对按键取 amax，一个 4 帧窗口里先按 W 后按 S，
-    两位就会同时为 1，直接拼串会得到 "walks forward and walks backward" 这种
-    自相矛盾的标注。W∧S 与 A∧D 是物理上互斥的对轴，同时置位时相消。
-    """
-    idx = {name: A.ACTIVE_KEY_COLS.index(name) for name in MOTION_ORDER}
-    on = {name: keys[idx[name]] > 0 for name in MOTION_ORDER}
-    for a, b in (("W", "S"), ("A", "D")):
-        if on[a] and on[b]:
-            on[a] = on[b] = False
-    words = [MOTION[name] for name in MOTION_ORDER if on[name]]
-    if not words:
-        return MOTION_IDLE
-    return " and ".join(words)
-
-
 def keys9(pooled: np.ndarray) -> np.ndarray:
-    """[latent_t, 17] -> [latent_t, 9] 的 0/1 动作张量。
+    """[latent_t, 17] -> a [latent_t, 9] 0/1 action tensor.
 
-    前 8 位是原始按键（amax 池化的结果），第 9 位 F 由 COLMAP 实测摇镜速率导出：
-    按了摇镜键且逐帧 |d_yaw| >= YAW_SHARP 时置 1。推理时这一位由用户直接按。
+    The first 8 bits are the raw keys (amax-pooled). The 9th bit, F, is
+    derived from the measured pan rate: set to 1 when a pan key is held and
+    the per-frame |d_yaw| >= YAW_SHARP. At inference this bit is set
+    directly by the user.
     """
     keys = (pooled[:, A.ACTIVE_KEY_INDICES] > 0).astype(np.float32)
     rate = _camera_rate(pooled)
@@ -143,10 +145,12 @@ def keys9(pooled: np.ndarray) -> np.ndarray:
 
 
 def _purify(on: dict[str, bool], pairs) -> None:
-    """对轴互斥的两个键同时置位时相消。
+    """Cancel a pair of mutually exclusive keys that ended up both set.
 
-    bin_to_latent 对按键取 amax，一个 4 帧窗口里先按 W 后按 S，两位就会同时为 1，
-    直接拼串会得到 "walks forward and walks backward" 这种自相矛盾的标注。
+    bin_to_latent takes amax over keys, so a 4-frame window with W pressed
+    then S pressed sets both bits to 1. Concatenating them naively would
+    produce a self-contradictory annotation like "walks forward and walks
+    backward".
     """
     for a, b in pairs:
         if on[a] and on[b]:
@@ -174,13 +178,16 @@ def _camera_clause(on: dict[str, bool], moving: bool) -> str:
 
 
 def annotate_from_keys9(k9: np.ndarray) -> list[str]:
-    """**标注是这 9 位的纯函数** —— 训练与推理因此走完全同一条路径。
+    """**The annotation is a pure function of these 9 bits** -- training and
+    inference therefore run through exactly the same code path.
 
-    代价是丢掉了 drifts 那一类（角色没动而相机自己在平移，占 1.7%）：
-    它按定义就无法从按键推出，推理时也给不出来，所以并进 holds steady。
+    The cost is dropping the "drifts" case (the character isn't moving but
+    the camera itself is translating, 1.7% of steps): it can't be derived
+    from the keys by definition, and inference has no way to produce it
+    either, so it folds into "holds steady".
     """
     if k9.ndim != 2 or k9.shape[1] != len(KEYS9):
-        raise ValueError(f"期望 [latent_t, {len(KEYS9)}]，得到 {list(k9.shape)}")
+        raise ValueError(f"expected [latent_t, {len(KEYS9)}], got {list(k9.shape)}")
     out = []
     for row in k9:
         on = {c: bool(row[i] > 0) for i, c in enumerate(KEYS9)}
@@ -191,7 +198,8 @@ def annotate_from_keys9(k9: np.ndarray) -> list[str]:
 
 
 def annotate(pooled: np.ndarray, **_ignored) -> list[str]:
-    """[latent_t, 17] -> 标注串。先导出 9 位动作，再走纯函数。"""
+    """[latent_t, 17] -> list of annotation strings. Derives the 9-bit
+    action first, then runs the pure function above."""
     return annotate_from_keys9(keys9(pooled))
 
 
@@ -202,9 +210,11 @@ def script_for_clip(action_path: Path, num_frames: int = 124, latent_t: int = 37
 
 
 def null_script(latent_t: int = 37) -> list[str]:
-    """CFG 的「动作零参考」负 prompt：同样的句式，动作全部置为静止。
+    """The CFG "zero action reference" negative prompt: the same sentence
+    shape, with every action set to stationary.
 
-    这样 cfg_scale 放大的恰好是动作那部分的差量，而不是笼统的 prompt 服从度。
+    This way, cfg_scale amplifies just the action-induced difference,
+    rather than generic prompt adherence.
     """
     return [f"the man {MOTION_IDLE}, camera {CAMERA_IDLE}"] * latent_t
 
@@ -219,35 +229,35 @@ def _self_test() -> None:
 
     scripts = [script_for_clip(clips / r["action"]) for r in rows]
 
-    print("== 单条样例 ==")
-    print(f"主体锚点: {SUBJECT_ANCHOR}")
+    print("== single-clip sample ==")
+    print(f"subject anchor: {SUBJECT_ANCHOR}")
     for s in scripts[0][:6]:
         print(f"  {s}")
-    print("  …")
+    print("  ...")
 
     flat = [s for sc in scripts for s in sc]
     vocab = sorted(set(flat))
-    print(f"\n== 词表 ==")
-    print(f"  {len(rows)} 条 clip × 37 步 = {len(flat)} 条标注，去重后 {len(vocab)} 种")
-    print(f"  单条 clip 内平均去重后 {np.mean([len(set(sc)) for sc in scripts]):.1f} 种")
+    print(f"\n== vocabulary ==")
+    print(f"  {len(rows)} clips x 37 steps = {len(flat)} annotations, {len(vocab)} distinct after dedup")
+    print(f"  average distinct sentences per clip: {np.mean([len(set(sc)) for sc in scripts]):.1f}")
 
     from collections import Counter
     c = Counter(flat)
-    print(f"\n== 出现最多的 8 种 ==")
+    print(f"\n== 8 most common ==")
     for s, n in c.most_common(8):
         print(f"  {n / len(flat):.3f}  {s}")
 
     idle = sum(1 for s in flat if f"{MOTION_IDLE}, camera {CAMERA_IDLE}" in s)
-    print(f"\n== 覆盖度 ==")
-    print(f"  完全静止（移动和相机都无）的步: {idle / len(flat):.3f}")
-    print(f"  含相机运动的步:               "
+    print(f"\n== coverage ==")
+    print(f"  fully stationary steps (no motion, no camera): {idle / len(flat):.3f}")
+    print(f"  steps with camera motion:                      "
           f"{sum(1 for s in flat if CAMERA_IDLE not in s) / len(flat):.3f}")
-    print(f"  含移动的步:                   "
+    print(f"  steps with character motion:                   "
           f"{sum(1 for s in flat if MOTION_IDLE not in s) / len(flat):.3f}")
 
     lens = [len(s) for s in vocab]
-    print(f"\n  标注串长度 {min(lens)}–{max(lens)} 字符")
-    print(f"\n负 prompt 参考: {null_script(1)[0]}")
+    print(f"\n  annotation length {min(lens)}-{max(lens)} characters")
+    print(f"\nnegative-prompt reference: {null_script(1)[0]}")
 
 
 if __name__ == "__main__":

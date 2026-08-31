@@ -1,19 +1,25 @@
 diff --git a/diffsynth/core/attention/attention.py b/diffsynth/core/attention/attention.py
-index c64bb54..f27a729 100644
+index c64bb54..8e2cdc2 100644
 --- a/diffsynth/core/attention/attention.py
 +++ b/diffsynth/core/attention/attention.py
-@@ -33,7 +33,14 @@ except ModuleNotFoundError:
+@@ -33,7 +33,20 @@ except ModuleNotFoundError:
  
  try:
      from torch.nn.attention.flex_attention import flex_attention as flex_attention_func
 -    flex_attention_func = torch.compile(flex_attention_func, dynamic=False, mode="max-autotune-no-cudagraphs", fullgraph=True, backend="inductor")
-+    # 不用 mode="max-autotune-no-cudagraphs"：它在第一步实测 6 个前向 + 13 个反向候选，
-+    # 而候选里有跑不了的 —— H200 上 BLOCK_M=BLOCK_N=128 那个要 233472 B 共享内存、
-+    # 硬件上限 232448 B。单个候选废掉本身无害（会被跳过），但基准测试阶段实测到
-+    # illegal memory access 会污染整个 CUDA context，8 卡训练里表现为随机某一张卡在
-+    # 第 0 步挂掉，且失败结果会写进按 device 分键的磁盘缓存，之后每次复现在同一张卡上。
-+    # 实测这个 autotune 一点收益都没有：1x56x16448x128 上赢家永远是默认启发式那个配置，
-+    # 稳态 75.6（默认）vs 76.1 ms/iter（autotune）。
++    # Not using mode="max-autotune-no-cudagraphs": at the first step it
++    # benchmarks 6 forward + 13 backward candidates, and one of them can't
++    # run at all -- on H200, the BLOCK_M=BLOCK_N=128 candidate needs 233472 B
++    # of shared memory against a hardware limit of 232448 B. A single failed
++    # candidate is harmless on its own (it gets skipped), but hitting an
++    # illegal memory access during the benchmarking phase poisons the whole
++    # CUDA context, which shows up in 8-GPU training as a random rank dying
++    # at step 0 -- and the failed result gets written into a disk cache
++    # keyed by device, so it reproduces on the same rank every time after
++    # that. Measured: this autotune buys nothing at all. At
++    # 1x56x16448x128, the winner is always the default heuristic
++    # configuration: steady state 75.6 ms/iter (default) vs. 76.1 ms/iter
++    # (autotune).
 +    flex_attention_func = torch.compile(flex_attention_func, dynamic=False, fullgraph=True, backend="inductor")
      FLEX_ATTN_AVAILABLE = True
  except (ModuleNotFoundError, ImportError):
@@ -31,10 +37,10 @@ index cc19051..5550247 100644
      return parser
  
 diff --git a/diffsynth/diffusion/runner.py b/diffsynth/diffusion/runner.py
-index 0e2c921..d0a570d 100644
+index 0e2c921..ab3be58 100644
 --- a/diffsynth/diffusion/runner.py
 +++ b/diffsynth/diffusion/runner.py
-@@ -124,9 +124,20 @@ def launch_data_process_task(
+@@ -124,9 +124,22 @@ def launch_data_process_task(
              with torch.no_grad():
                  folder = os.path.join(model_logger.output_path, str(accelerator.process_index))
                  os.makedirs(folder, exist_ok=True)
@@ -44,9 +50,11 @@ index 0e2c921..d0a570d 100644
 +                # attaches the original row id so post-processing can align sidecars.
 +                source_data_id = int(data.pop("_diffsynth_data_id", data_id))
 +                save_path = os.path.join(folder, f"{source_data_id}.pth")
-+                # 断点续跑：全量 20699 条要跑 ~36h，中途挂掉不该从头再来。
-+                # 先写 .tmp 再 rename（同目录内 rename 是原子的），所以只要
-+                # 最终文件存在就一定是完整的，可以安全跳过。
++                # Resumable: the full 20699-row run takes ~36h, and a crash
++                # partway through shouldn't mean starting over. Write to
++                # .tmp first, then rename (same-directory rename is
++                # atomic), so if the final file exists it's guaranteed
++                # complete and safe to skip.
 +                if os.path.exists(save_path):
 +                    continue
                  data = model(data)
@@ -58,23 +66,27 @@ index 0e2c921..d0a570d 100644
                      offload_manager.after_backward()
  
 diff --git a/diffsynth/models/minimax_h3_dit.py b/diffsynth/models/minimax_h3_dit.py
-index 2a4684e..dd76842 100644
+index 2a4684e..573d181 100644
 --- a/diffsynth/models/minimax_h3_dit.py
 +++ b/diffsynth/models/minimax_h3_dit.py
-@@ -63,11 +63,33 @@ def _modulate_scale_shift(x, shift, scale, indices):
+@@ -63,11 +63,38 @@ def _modulate_scale_shift(x, shift, scale, indices):
      return (x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(x.dtype)
  
  
 +def _apply_action_film(h, a_scale, a_shift, v0, n_video, latent_t, frame_rows):
-+    """把动作调制加到 video 段上：h_v <- h_v * (1 + scale) + shift。
++    """Apply the action modulation to the video segment: h_v <- h_v * (1 + scale) + shift.
 +
-+    与旧的加性 bias 的区别只有一处，但那一处是关键：scale 是**乘性**的，
-+    调制效果随 h 本身变化。加性 bias 给每个键一个与画面内容无关的固定向量，
-+    而"按 D 键"的视觉效果依赖当前朝向和场景——不同样本要求 bias 指向不同方向，
-+    梯度会互相抵消（实测 ΔW 与 W 的方向余弦只有 +0.064）。
++    Only one thing differs from the old additive bias, but it's the
++    important one: scale is **multiplicative**, so the modulation changes
++    with h itself. An additive bias gives each key a fixed vector
++    independent of the picture, but the visual effect of "press D" depends
++    on the current heading and scene -- different samples need the bias to
++    point in different directions, and the gradients cancel each other out
++    (measured cosine between delta-W and W's own direction: only +0.064).
 +
-+    [latent_t, 1, C] 广播到 [latent_t, frame_rows, C]，不物化中间张量：
-+    真实尺寸下 repeat_interleave 是 14430x5376 bf16 ≈ 155 MB/层 x 50 层。
++    Broadcasts [latent_t, 1, C] to [latent_t, frame_rows, C] without
++    materializing the expanded tensor: at real sizes,
++    repeat_interleave would be 14430x5376 bf16 ~= 155 MB/layer x 50 layers.
 +    """
 +    video = h.narrow(0, v0, n_video).view(latent_t, frame_rows, -1)
 +    video = video * (1.0 + a_scale.unsqueeze(1)) + a_shift.unsqueeze(1)
@@ -91,12 +103,13 @@ index 2a4684e..dd76842 100644
  
 -def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale):
 +def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, block_masks=None):
-+    """block_masks: {段起点: BlockMask}。FlexAttention 的索引是**段内局部**的，
-+    所以掩码必须按段各建一个，不能拿整条序列的掩码硬塞进来。"""
++    """block_masks: {segment start: BlockMask}. FlexAttention indices are
++    **local to each segment**, so a mask has to be built per segment; a
++    single mask for the whole sequence can't be reused across segments."""
      out = torch.empty_like(q)
      bounds = cu_seqlens.tolist()
      for start, stop in zip(bounds[:-1], bounds[1:]):
-@@ -76,11 +98,101 @@ def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale):
+@@ -76,11 +103,145 @@ def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale):
          seg_q = q[start:stop].transpose(0, 1).unsqueeze(0)
          seg_k = k[start:stop].transpose(0, 1).unsqueeze(0)
          seg_v = v[start:stop].transpose(0, 1).unsqueeze(0)
@@ -111,13 +124,20 @@ index 2a4684e..dd76842 100644
      return out
  
  
-+# 掩码用的持久缓冲区，按 (device, 段起点, 段长) 复用。
-+# **必须复用同一批张量对象**：flex_attention 是 torch.compile 过的，mask_mod 闭包会被
-+# 内联进 kernel。若每条样本都新建闭包/张量，会出两个后果，且都不报错：
-+#   1. Dynamo 每次都判定为新图 -> 几步内撞满重编译上限（FailOnRecompileLimitHit）
-+#   2. 更糟：实测把第一次的 mask_mod 烘焙进 kernel 后复用，**后续样本全用着第一条的掩码**
-+#      （探针里两个掩码换顺序跑，先跑的对、后跑的错 3.02，坐实了）
-+# 闭在固定缓冲区上、每条样本原地改写内容，两个问题一起解决。
++# Persistent buffers for the mask, reused by (device, segment start,
++# segment length). **The same tensor objects must be reused**: flex_attention
++# is torch.compile'd, and the mask_mod closure gets inlined into the kernel.
++# Allocating a new closure/tensor per sample causes two failures, neither of
++# which raises an error:
++#   1. Dynamo treats every call as a new graph -> hits the recompile limit
++#      within a few steps (FailOnRecompileLimitHit).
++#   2. Worse: in practice, once the first sample's mask_mod is baked into
++#      the kernel, it gets reused -- **every later sample silently runs
++#      against the first sample's mask** (confirmed by swapping the order
++#      of two probe masks: whichever ran first was correct, the second was
++#      wrong, with a score of 3.02).
++# Closing over a fixed buffer and overwriting its contents in place for
++# each sample fixes both problems at once.
 +_MASK_BUFFERS: dict = {}
 +
 +
@@ -136,21 +156,31 @@ index 2a4684e..dd76842 100644
 +
 +def _build_action_block_masks(ann_rows, v0, fr, latent_t, cu_seqlens, seq_len, device,
 +                              n_real=None):
-+    """逐 latent 文本条件的硬绑定掩码。
++    """The hard binding mask for per-latent text conditioning.
 +
-+    只做一件事：**让第 k 条标注行与第 k 帧以外的 video 行互相不可见**。
-+    其余全部不动 —— video×video、主体锚点×全部 video、标注×标注、标注×首帧 cond
-+    都保持原样，这样去掉标注行就精确回到原模型，落点探针的等价性判据才成立。
++    Does exactly one thing: **makes annotation row k and every video row
++    outside frame k mutually invisible**. Everything else is untouched --
++    video x video, subject anchor x all video, annotation x annotation, and
++    annotation x first-frame cond all stay exactly as in the base model, so
++    removing the annotation rows recovers the original model precisely,
++    which is what makes the equivalence check in the mask probe valid.
 +
-+    自注意力对 token 是置换等变的，光把 37 条标注塞进序列，模型无从知道哪条对哪帧；
-+    位置（镜像偏移）只提供软偏置，这个掩码才是架构级的保证。
++    Self-attention is permutation-equivariant, so simply adding 37
++    annotation rows to the sequence gives the model no way to know which
++    one belongs to which frame; position (the mirrored offset) is only a
++    soft bias, and this mask is what actually guarantees it architecturally.
 +
-+    第二件事是 padding：packed 会把有效长度补到全数据集统一值（否则 flex_attention 每
-+    换一个序列长度就重编译一次），这里必须把 pad 行屏蔽掉 —— 那些行是零向量，不屏蔽
-+    会参与 softmax、改变分母。pad 行只允许看自己，否则整行没有可见 key，softmax 出 NaN。
++    The second thing this does is padding: `packed` pads the valid length
++    to a value shared across the whole dataset (otherwise flex_attention
++    recompiles every time the sequence length changes), so the pad rows
++    have to be masked out here -- they're zero vectors, and leaving them
++    unmasked would let them participate in the softmax and change its
++    denominator. A pad row is only allowed to see itself; otherwise it has
++    no visible key at all and softmax produces NaN.
 +
-+    ann_rows: [latent_t, 2]，每条标注在序列里的 (起, 止) 绝对行号。
-+    n_real:   padding 之前的真实长度；None 表示没有 padding。
++    ann_rows: [latent_t, 2], the (start, end) absolute row indices of each
++              annotation in the sequence.
++    n_real:   the real length before padding; None means no padding.
 +    """
 +    from torch.nn.attention.flex_attention import create_block_mask
 +
@@ -183,12 +213,39 @@ index 2a4684e..dd76842 100644
 +        any_frm = bool(vhi > 0 and vlo < length)
 +
 +        if not (any_ann and any_frm) and not has_pad:
-+            continue                      # 这一段既没有绑定要做，也没有 pad 要屏蔽
++            continue                      # this segment has nothing to bind and nothing to pad-mask
 +
 +        def mask_mod(b, h, q, kv, ann=ann, frm=frm, lim=lim):
 +            aq, akv, fq, fkv = ann[q], ann[kv], frm[q], frm[kv]
-+            blocked = (((aq >= 0) & (fkv >= 0) & (aq != fkv))
-+                       | ((fq >= 0) & (akv >= 0) & (fq != akv)))
++            # When an annotation row is the **key**, only two kinds of query
++            # can read it:
++            #   1) the same annotation's own rows (a sentence needs to
++            #      attend to itself internally)
++            #   2) the one video latent it's bound to
++            # Static text, the first-frame cond, audio, and **every other
++            # annotation row** can never read it.
++            #
++            # This is what makes it "directed": only the outgoing edges are
++            # blocked, not the incoming ones. An annotation row reading
++            # static text / cond / its own video is left alone -- that's
++            # information **flowing into** the annotation row, not a
++            # bypass A_j -> V_k, and it gives the action sentence scene
++            # grounding.
++            #
++            # With the outgoing edges blocked, it follows that any path
++            # from A_k to V_j (j != k) must pass through V_k first, i.e.
++            # V_k is a cut vertex between A_k and the rest of the sequence.
++            # "A_k never reads another A_j" is required for this to hold --
++            # otherwise A_j's content would flow into A_k first, and V_k
++            # reading A_k would be reading A_j too, and the cut-vertex
++            # property would break immediately.
++            same_ann = (aq >= 0) & (akv >= 0) & (aq == akv)
++            v_reads_own = (fq >= 0) & (akv >= 0) & (fq == akv)
++            leak_out = (akv >= 0) & ~same_ann & ~v_reads_own
++            # Incoming edges are unchanged: an annotation row only reads
++            # the one latent it's bound to, not any other latent.
++            leak_in = (aq >= 0) & (fkv >= 0) & (aq != fkv)
++            blocked = leak_out | leak_in
 +            real = (q < lim) & (kv < lim)
 +            return (q == kv) | (real & ~blocked)
 +
@@ -199,7 +256,7 @@ index 2a4684e..dd76842 100644
  class MiniMaxH3Rope(nn.Module):
      def __init__(self, inv_freq_len: int) -> None:
          super().__init__()
-@@ -133,7 +245,7 @@ class MiniMaxH3Attention(nn.Module):
+@@ -133,7 +294,7 @@ class MiniMaxH3Attention(nn.Module):
          self.k_norm = _norm(attention_head_dim, eps=qk_norm_eps)
          self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
  
@@ -208,7 +265,7 @@ index 2a4684e..dd76842 100644
          total = x.shape[0]
          qkv = self.qkv_proj(x)
          qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
-@@ -145,7 +257,8 @@ class MiniMaxH3Attention(nn.Module):
+@@ -145,7 +306,8 @@ class MiniMaxH3Attention(nn.Module):
          if rope_freqs is not None:
              q = _apply_rope(q, rope_freqs)
              k = _apply_rope(k, rope_freqs)
@@ -218,7 +275,7 @@ index 2a4684e..dd76842 100644
          out = out.reshape(total, self.num_heads * self.head_dim)
          return self.out_proj(out)
  
-@@ -220,12 +333,19 @@ class MiniMaxH3DiTBlock(nn.Module):
+@@ -220,12 +382,21 @@ class MiniMaxH3DiTBlock(nn.Module):
          self.mlp = MiniMaxH3MLP(hidden_size, ffn_hidden_size)
          self.adaln_proj = MiniMaxH3AdalnProj(hidden_size, time_embed_dim, adaln_out_features, expand_ratio=6, modality_num=MINIMAX_H3_ADALN_MODALITY_NUM)
  
@@ -231,8 +288,10 @@ index 2a4684e..dd76842 100644
          h = self.norm1(x)
          h = _modulate_scale_shift(h, shift_msa, scale_msa, combined_indices)
 -        h = self.attn(h, rope_freqs=rope_freqs, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-+        # 动作调制紧跟在 AdaLN 之后：这里 h 刚过 RMSNorm、量级确定（rms≈1），
-+        # scale=0.05 就确切是 5% 调制；而且这正是模型预训练时习惯接受调制的位置。
++        # The action modulation goes right after AdaLN: h has just been
++        # through RMSNorm here, so its scale is fixed (rms~=1), and
++        # scale=0.05 means exactly a 5% modulation -- and this is also the
++        # position the model is already used to being modulated at from pretraining.
 +        if action_film is not None:
 +            h = _apply_action_film(h, *action_film)
 +        h = self.attn(h, rope_freqs=rope_freqs, cu_seqlens=cu_seqlens,
@@ -240,39 +299,47 @@ index 2a4684e..dd76842 100644
          x = _modulate_gate(residual, gate_msa, h, combined_indices)
          residual = x
          h = self.norm2(x)
-@@ -282,6 +402,9 @@ class MiniMaxH3DiT(nn.Module):
+@@ -282,6 +453,9 @@ class MiniMaxH3DiT(nn.Module):
          self.hidden_size = hidden_size
          self.num_attention_heads = num_attention_heads
          self.num_channels_latents = latents_dim
 +        self.num_layers = num_layers
-+        self.num_action_buttons = 0          # 见 enable_action_conditioning
++        self.num_action_buttons = 0          # see enable_action_conditioning
 +        self.action_mode = "film"
          video_patch_dim = latents_dim * patch_size[0] * patch_size[1] * patch_size[2]
  
          self.video_patch_proj = nn.Linear(video_patch_dim, hidden_size, bias=True)
-@@ -298,6 +421,51 @@ class MiniMaxH3DiT(nn.Module):
+@@ -298,6 +472,59 @@ class MiniMaxH3DiT(nn.Module):
          )
          self.final_layer = MiniMaxH3FinalLayer(hidden_size, time_embed_dim, final_adaln_out_features, latents_dim, audio_latents_dim, patch_size, final_norm_eps)
  
 +    def enable_action_conditioning(self, num_buttons: int, mode: str = "film"):
-+        """建立动作注入层。mode="film"（默认）或 "bias"（旧的加性，仅供对照）。
++        """Build the action injection layers. mode="film" (default) or
++        "bias" (the old additive path, kept only for comparison).
 +
-+        为什么不放在 __init__：core/loader/model.py:89 用 load_state_dict(assign=True)
-+        加载预训练 DiT，strict 默认为 True。__init__ 里凭空多出这些参数
-+        会直接 Missing key(s) 报错。所以必须等权重加载完再建。
++        Why not in __init__: core/loader/model.py:89 loads the pretrained
++        DiT with load_state_dict(assign=True), strict=True by default.
++        Having these parameters appear out of nowhere in __init__ would
++        raise Missing key(s) immediately. So this has to run after the
++        pretrained weights are loaded.
 +
-+        两种模式都零初始化，注入通路接上的瞬间模型输出**严格等价于原模型**
-+        （film 模式下 (1+0)*h+0 = h），落点探针那套判据继续成立。
++        Both modes are zero-initialized, so the moment the injection path
++        is wired up, the model's output is **exactly equivalent to the
++        base model** ((1+0)*h+0 = h in film mode), and the equivalence
++        check in the mask probe continues to hold.
 +
-+        但两者的学习行为完全不同：
-+          bias  —— Δh = b(a)，与 h 无关。实测 7872 条训到 2952 步，
-+                    单层 bias L2 只有 0.24（相对 hidden 224.55 是 0.107%），
-+                    且增速持续衰减（×1.607 → ×1.111），因为不同样本要求 b
-+                    指向不同方向、梯度互相抵消。
-+          film  —— Δh = scale(a) ⊙ h + shift(a)，调制随内容变化，不存在这个冲突。
++        But the two modes learn very differently:
++          bias  -- delta_h = b(a), independent of h. Measured on 7872
++                   clips at step 2952: a single layer's bias L2 norm is
++                   only 0.24 (0.107% relative to hidden's 224.55), and its
++                   growth rate keeps decaying (x1.607 -> x1.111), because
++                   different samples need b to point in different
++                   directions and the gradients cancel out.
++          film  -- delta_h = scale(a) (x) h + shift(a); the modulation
++                   varies with content, so this conflict doesn't happen.
 +        """
 +        if mode not in ("film", "bias"):
-+            raise ValueError(f"未知的 action mode: {mode}")
++            raise ValueError(f"unknown action mode: {mode}")
 +        ref = next(self.parameters())
 +        self.num_action_buttons = num_buttons
 +        self.action_mode = mode
@@ -285,8 +352,8 @@ index 2a4684e..dd76842 100644
 +                nn.init.zeros_(m.weight)
 +            self.action_embedders.to(device=ref.device, dtype=ref.dtype)
 +        else:
-+            # 每层一对零初始化投影：scale 走乘性、shift 走加性。
-+            # 参数量 2 x 50 x num_buttons x hidden，与旧的 bias 版同量级。
++            # One zero-initialized projection pair per layer: scale is multiplicative, shift is additive.
++            # Parameter count 2 x 50 x num_buttons x hidden, the same order as the old bias version.
 +            self.action_scale = nn.ModuleList(
 +                [nn.Linear(num_buttons, self.hidden_size, bias=False) for _ in range(self.num_layers)]
 +            )
@@ -302,7 +369,7 @@ index 2a4684e..dd76842 100644
      def _embed(self, *, x, audio_x, text_embeddings_selected, unique_timesteps, img_pos, audio_pos, text_pos, refiner_cu_seqlens, refiner_max_seqlen, seq_len, device):
          dtype = text_embeddings_selected.dtype
          x_rows = x.view(-1, x.shape[-1]).index_select(0, img_pos).to(dtype)
-@@ -336,6 +504,11 @@ class MiniMaxH3DiT(nn.Module):
+@@ -336,6 +563,11 @@ class MiniMaxH3DiT(nn.Module):
          use_gradient_checkpointing_offload=False,
          update_audio_mask=None,
          skip_mask_out_condition=False,
@@ -314,16 +381,20 @@ index 2a4684e..dd76842 100644
      ) -> tuple[torch.Tensor, torch.Tensor]:
          inverse_indices = inverse_indices.view(-1).to(torch.long)
          token_tags = token_tags.view(-1).to(torch.long)
-@@ -371,7 +544,47 @@ class MiniMaxH3DiT(nn.Module):
+@@ -371,7 +603,51 @@ class MiniMaxH3DiT(nn.Module):
  
          hidden = decoder_input
          cu_seqlens = cu_seqlens.to(device)
 -        for block in self.blocks:
 +
-+        # 动作注入的落点。序列布局是 [text | cond | audio | video | pad]，video 段连续，
-+        # 起点由 model_fn 用 img_pos[cond_rows_count:][0] 算好传进来。
-+        # 关键：img_pos 前 cond_rows_count 行是首尾帧 keyframe anchor 而不是视频帧，
-+        # 整块相加会把 bias 糊到 anchor 上、污染首尾帧条件，所以必须跳过。
++        # Where the action injection lands. The sequence layout is
++        # [text | cond | audio | video | pad], the video segment is
++        # contiguous, and its start is computed by model_fn from
++        # img_pos[cond_rows_count:][0] and passed in here. Important: the
++        # first cond_rows_count rows of img_pos are the first/last-frame
++        # keyframe anchors, not video frames -- adding the whole block
++        # would smear the bias onto the anchors and corrupt the
++        # first/last-frame condition, so those rows must be skipped.
 +        inject_action = action_cond is not None and self.num_action_buttons > 0
 +        if inject_action:
 +            v0 = int(action_video_start)
@@ -331,10 +402,10 @@ index 2a4684e..dd76842 100644
 +            latent_t = action_cond.shape[0]
 +            n_video = latent_t * fr
 +            if v0 + n_video > hidden.shape[0]:
-+                raise ValueError(f"action video span [{v0}, {v0 + n_video}) 越界，seq_len={hidden.shape[0]}")
++                raise ValueError(f"action video span [{v0}, {v0 + n_video}) is out of range, seq_len={hidden.shape[0]}")
 +            action_cond = action_cond.to(device=hidden.device, dtype=hidden.dtype)
 +
-+        # 逐 latent 文本条件的硬绑定掩码。整个 forward 只建一次，50 层共用。
++        # The hard binding mask for per-latent text conditioning. Built once per forward pass, shared by all 50 layers.
 +        block_masks = None
 +        if action_text_rows is not None:
 +            block_masks = _build_action_block_masks(
@@ -347,12 +418,12 @@ index 2a4684e..dd76842 100644
 +            film = None
 +            if inject_action:
 +                if self.action_mode == "film":
-+                    # 调制参数每层各算一份，注入发生在 block 内部（norm+AdaLN 之后）
++                    # Modulation parameters are computed once per layer; the injection happens inside the block (after norm+AdaLN).
 +                    film = (self.action_scale[i](action_cond), self.action_shift[i](action_cond),
 +                            v0, n_video, latent_t, fr)
 +                else:
-+                    # 旧的加性路径：注入在 block 入口，也就是 RMSNorm 之前。
-+                    # 保留仅为对照实验，已实测在 2952 步后仍只有 0.107% 的相对量级。
++                    # The old additive path: injected at the block entrance, i.e. before RMSNorm.
++                    # Kept only for comparison; measured at only 0.107% relative magnitude after step 2952.
 +                    emb = self.action_embedders[i](action_cond)
 +                    video = hidden.narrow(0, v0, n_video).view(latent_t, fr, -1) + emb.unsqueeze(1)
 +                    hidden = torch.cat([
@@ -363,7 +434,7 @@ index 2a4684e..dd76842 100644
              hidden = gradient_checkpoint_forward(
                  block,
                  use_gradient_checkpointing,
-@@ -382,6 +595,8 @@ class MiniMaxH3DiT(nn.Module):
+@@ -382,6 +658,8 @@ class MiniMaxH3DiT(nn.Module):
                  rope_freqs=rope_freqs,
                  cu_seqlens=cu_seqlens,
                  max_seqlen=max_seqlen,
@@ -373,26 +444,30 @@ index 2a4684e..dd76842 100644
  
          video_logits, audio_logits = self.final_layer(hidden, t_emb=t_emb, inverse_indices=inverse_indices)
 diff --git a/diffsynth/pipelines/minimax_h3_audio_video.py b/diffsynth/pipelines/minimax_h3_audio_video.py
-index 7f845ef..0d29686 100644
+index 7f845ef..0aa22d9 100644
 --- a/diffsynth/pipelines/minimax_h3_audio_video.py
 +++ b/diffsynth/pipelines/minimax_h3_audio_video.py
-@@ -103,6 +103,15 @@ class MiniMaxH3Pipeline(BasePipeline):
+@@ -103,6 +103,19 @@ class MiniMaxH3Pipeline(BasePipeline):
          retake_audio: torch.Tensor = None,
          retake_audio_sample_rate: int = 32000,
          seconds_regions_to_retake: list[tuple[float, float]] = None,
 +        action_cond: torch.Tensor = None,
-+        # 逐 latent 动作文本条件。action_script 是 latent_t 条标注；
-+        # negative_action_script 建议传"动作零参考"（全部静止），
-+        # 这样 cfg_scale 放大的恰好是动作那部分的差量，而不是笼统的 prompt 服从度。
++        # Per-latent action-text condition. action_script is latent_t
++        # annotation sentences; negative_action_script should be the
++        # "zero action reference" (everything stationary), so cfg_scale
++        # amplifies just the action-induced difference, not generic
++        # prompt adherence.
 +        action_script: list = None,
 +        negative_action_script: list = None,
-+        # 把有效长度 padding 到固定值，避免 flex_attention 反复重编译。
-+        # 训练侧由 inject_abot_text.py 按全数据集算好写进缓存，推理侧应传同一个值。
++        # Pad the valid length to a fixed value, to avoid repeated
++        # flex_attention recompilation. On the training side this is
++        # computed over the whole dataset and written into the cache by
++        # inject_abot_text.py; inference should pass the same value.
 +        action_pad_used_to: int = None,
          progress_bar_cmd=tqdm,
      ):
          """Generate a joint video + audio sample.
-@@ -127,8 +136,9 @@ class MiniMaxH3Pipeline(BasePipeline):
+@@ -127,8 +140,9 @@ class MiniMaxH3Pipeline(BasePipeline):
          self.scheduler.set_timesteps(num_inference_steps, shift=flow_shift)
          self.scheduler_audio.set_timesteps(num_inference_steps, shift=audio_flow_shift)
  
@@ -404,7 +479,7 @@ index 7f845ef..0d29686 100644
          inputs_shared = {
              "cfg_scale": cfg_scale,
              "height": height, "width": width, "num_frames": num_frames,
-@@ -141,6 +151,8 @@ class MiniMaxH3Pipeline(BasePipeline):
+@@ -141,6 +155,8 @@ class MiniMaxH3Pipeline(BasePipeline):
              "retake_video": retake_video, "frame_regions_to_retake": frame_regions_to_retake,
              "retake_audio": (retake_audio, retake_audio_sample_rate) if retake_audio is not None else None, "seconds_regions_to_retake": seconds_regions_to_retake,
              "imgvid_cond_noise_aug": self.imgvid_cond_noise_aug, "audio_cond_noise_aug": self.audio_cond_noise_aug,
@@ -413,7 +488,7 @@ index 7f845ef..0d29686 100644
          }
  
          # 3. Unit chain
-@@ -208,10 +220,10 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
+@@ -208,10 +224,10 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
      def __init__(self):
          super().__init__(
              seperate_cfg=True,
@@ -427,16 +502,21 @@ index 7f845ef..0d29686 100644
              onload_model_names=("text_encoder",),
          )
  
-@@ -248,7 +260,27 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
+@@ -248,7 +264,32 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
          input_ids, text_token_tags = presentation_ref2va(pipe.tokenizer, prompt, condition_labels, image_counts, video_counts, video_timestamps)
          return input_ids, text_token_tags, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
  
 -    def process(self, pipe: MiniMaxH3Pipeline, prompt, keyframes=None, ref_blocks=None, height=None, width=None):
 +    def _encode_action_script(self, pipe, script, head_len, dtype):
-+        """逐 latent 动作文本条件：每条**独立编码**后接在头部之后。
++        """Per-latent action-text condition: each sentence is **encoded
++        independently**, then appended after the head.
 +
-+        独立编码而非整段编码，是流式的硬约束（推理时未来动作未知，没法一次编码整段），
-+        顺带白拿一致性 —— 同一句话永远得到同一个嵌入。同一条片段里重复的句子只编一次。
++        Encoding independently rather than as one block is a hard
++        requirement for streaming (future actions are unknown at
++        inference time, so the whole sequence can't be encoded at once),
++        and it gets consistency for free -- the same sentence always
++        produces the same embedding. A sentence repeated within one clip
++        is only encoded once.
 +        """
 +        cache, rows, spans, cursor = {}, [], [], head_len
 +        for line in script:
@@ -456,7 +536,7 @@ index 7f845ef..0d29686 100644
          pipe.load_models_to_device(self.onload_model_names)
          pixel_values = image_grid_thw = pixel_values_videos = video_grid_thw = None
          if ref_blocks:
-@@ -269,8 +301,18 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
+@@ -269,8 +310,18 @@ class MiniMaxH3Unit_PromptEmbedder(PipelineUnit):
              kwargs["pixel_values_videos"] = pixel_values_videos.to(pipe.device, pipe.torch_dtype)
              kwargs["video_grid_thw"] = video_grid_thw.to(pipe.device, torch.long)
          hidden = pipe.text_encoder(**kwargs)
@@ -476,7 +556,7 @@ index 7f845ef..0d29686 100644
  
  
  class MiniMaxH3Unit_InputVideoEmbedder(PipelineUnit):
-@@ -546,9 +588,11 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
+@@ -546,9 +597,11 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
      def __init__(self):
          super().__init__(
              seperate_cfg=True,
@@ -491,7 +571,7 @@ index 7f845ef..0d29686 100644
              output_params=("packed",)
          )
  
-@@ -595,14 +639,33 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
+@@ -595,14 +648,41 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
          return torch.cat([torch.full((audio_t,), float(w_grid[0]), dtype=torch.float64),
                            torch.full((audio_rows - audio_t,), float(w_grid[-1]), dtype=torch.float64)])
  
@@ -502,16 +582,24 @@ index 7f845ef..0d29686 100644
 +                            pad_used_to=None):
 +        """fl2va layout: [text | cond | audio | video | pad].
 +
-+        pad_used_to: 把有效长度 padding 到这个固定值。flex_attention 是 torch.compile 过的，
-+        每个不同的序列长度都会触发重编译，而逐条样本的 text_len 不同，几步就会撞满
-+        Dynamo 的重编译上限。padding 到全数据集统一值后只需编译一次。
-+        多出来的行是零向量，由 DiT 的掩码屏蔽（见 _build_action_block_masks 的 n_real）。
++        pad_used_to: pad the valid length to this fixed value.
++        flex_attention is torch.compile'd, and every distinct sequence
++        length triggers a recompile; with a different text_len per sample,
++        this hits Dynamo's recompile limit within a few steps. Padding to a
++        value shared across the whole dataset means it only compiles once.
++        The extra rows are zero vectors, masked out by the DiT's attention
++        mask (see n_real in _build_action_block_masks).
 +
-+        action_text_spans: 逐 latent 文本条件的行区间 [(start, stop), ...]（文本段内偏移）。
-+        给了就把这些行按**镜像偏移**排布：第 k 条放在 t = (text_len - 视频跨度) + s_k，
-+        与第 k 帧的 t 偏移恒为负的常数。这样绑定信号是"往回看固定距离"一条统一规则，
-+        而"文本永远在视频之前"这条预训练不变量不破 —— 直接放到帧的 t 上会让
-+        文本↔视频的 t 偏移出现零和正值，那是预训练里没有的配置。
++        action_text_spans: row spans [(start, stop), ...] of the per-latent
++        text condition (offsets within the text segment). When given, these
++        rows are laid out with a **mirrored offset**: row k is placed at
++        t = (text_len - video span) + s_k, so its t-offset from frame k's t
++        is a constant negative number. This makes the binding signal a
++        single uniform rule ("look back a fixed distance"), without
++        breaking the pretraining invariant that text always comes before
++        video in t -- placing it directly at the frame's own t would make
++        the text<->video t-offset both zero and positive, a configuration
++        pretraining never saw.
 +        """
          frame_rows = (latent_h // 2) * (latent_w // 2)
          video_rows = latent_t * frame_rows
@@ -522,33 +610,34 @@ index 7f845ef..0d29686 100644
 +        real_used = used
 +        if pad_used_to is not None:
 +            if pad_used_to < used:
-+                raise ValueError(f"pad_used_to {pad_used_to} 小于实际长度 {used}")
++                raise ValueError(f"pad_used_to {pad_used_to} is smaller than the actual length {used}")
 +            used = int(pad_used_to)
          seq_len = self._aligned_seq_len(used)
  
          text_sl = slice(0, text_len)
-@@ -617,6 +680,30 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
+@@ -617,6 +697,31 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
          g = torch.zeros(seq_len, 3, dtype=torch.float64)
          g[text_sl, 0] = torch.arange(text_len, dtype=torch.float64)
  
 +        action_text_rows = None
 +        if action_text_spans is not None:
 +            if len(action_text_spans) != latent_t:
-+                raise ValueError(f"action_text_spans 应有 {latent_t} 条，得到 {len(action_text_spans)}")
++                raise ValueError(f"action_text_spans should have {latent_t} entries, got {len(action_text_spans)}")
 +            prev = 0
 +            for k, (lo, hi) in enumerate(action_text_spans):
 +                if not (0 <= lo < hi <= text_len):
-+                    raise ValueError(f"第 {k} 条区间 ({lo},{hi}) 越出文本段 [0,{text_len})")
++                    raise ValueError(f"span {k} ({lo},{hi}) is outside the text segment [0,{text_len})")
 +                if lo < prev:
-+                    raise ValueError(f"第 {k} 条区间 ({lo},{hi}) 与前一条重叠或未按序")
++                    raise ValueError(f"span {k} ({lo},{hi}) overlaps or is out of order with the previous one")
 +                prev = hi
 +            s_k = self._video_t_grid(latent_t, 0.0)
-+            origin = float(text_len) - float(s_k[-1]) - 1.0     # 退一格，避免末条与首帧 cond 撞同一个 t
++            origin = float(text_len) - float(s_k[-1]) - 1.0     # back off by one step so the last row doesn't land on the same t as the first-frame cond
 +            head_end = int(action_text_spans[0][0])
 +            if origin < head_end:
 +                raise ValueError(
-+                    f"标注块要占 t ∈ [{origin:.0f}, {origin + float(s_k[-1]):.0f}]，"
-+                    f"与前面的图像/锚点段 [0,{head_end}) 重叠；文本段需要更长或标注需更短")
++                    f"the annotation block would need t in [{origin:.0f}, {origin + float(s_k[-1]):.0f}], "
++                    f"which overlaps the preceding image/anchor segment [0,{head_end}); "
++                    f"lengthen the text segment or shorten the annotations")
 +            rows = []
 +            for k, (lo, hi) in enumerate(action_text_spans):
 +                g[lo:hi, 0] = origin + float(s_k[k])
@@ -558,7 +647,7 @@ index 7f845ef..0d29686 100644
          sqrt_area = np.sqrt(latent_h * latent_w)
          frame, w_grid = self._frame_grid(latent_h, latent_w, sqrt_area)
  
-@@ -642,11 +729,17 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
+@@ -642,11 +747,19 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
          token_tags[audio_sl] = 2
          token_tags[img_pos] = 0  # both cond and video rows are tagged as video (0)
  
@@ -570,6 +659,8 @@ index 7f845ef..0d29686 100644
          }
 +        if action_text_rows is not None:
 +            out["action_text_rows"] = action_text_rows
++            # Local spans within the text segment, used to split the Token Refiner's segments (see the refiner_cu note below).
++            out["action_text_spans_local"] = [(int(lo), int(hi)) for lo, hi in action_text_spans]
 +            out["action_video_start"] = video_sl.start
 +            out["action_frame_rows"] = frame_rows
 +            out["action_real_used"] = real_used
@@ -577,7 +668,7 @@ index 7f845ef..0d29686 100644
  
      def _build_packed_ref2va(self, text_len, latent_t, latent_h, latent_w, audio_t, ref_blocks, audio_channel=2):
          """ref2va layout: [text | ref_0 | ref_1 | ... | target_audio | target_video | pad]"""
-@@ -775,14 +868,17 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
+@@ -775,14 +888,17 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
              "seq_len": seq_len,
          }
  
@@ -597,39 +688,96 @@ index 7f845ef..0d29686 100644
  
          packed["token_tags"][packed["text_pos"]] = text_token_tags.cpu()
          if pipe.device == "mps":
-@@ -809,8 +905,13 @@ def model_fn_minimax_h3(
+@@ -809,8 +925,16 @@ def model_fn_minimax_h3(
      audio_cond_noise_aug=1.0,
      use_gradient_checkpointing=False,
      use_gradient_checkpointing_offload=False,
 +    action_cond=None,
      **kwargs,
  ):
-+    # action_cond 是 [latent_t, num_buttons] 的分段池化后按键张量。
-+    # 这个形参必须存在，哪怕只是透传：两阶段训练里 stage 1 末尾的 GeneralUnit_RemoveCache
-+    # 按 inspect.signature(pipe.model_fn).parameters 组白名单剪缓存，不在白名单的 key
-+    # 会被剪掉，stage 2 就读不到动作了。**kwargs 不算数，必须是具名形参。
++    # action_cond is the binned, pooled key tensor, [latent_t, num_buttons].
++    # This parameter must exist even if it's only ever passed through:
++    # GeneralUnit_RemoveCache at the end of stage 1 of two-stage training
++    # builds its keep-list from inspect.signature(pipe.model_fn).parameters,
++    # and any key not on that list gets dropped from the cache, so stage 2
++    # would never see the action. **kwargs doesn't count -- it has to be a
++    # named parameter.
      t_video = 1.0 - float(timestep_video) / 1000
      t_audio = 1.0 - float(timestep_audio) / 1000
  
-@@ -874,6 +975,16 @@ def model_fn_minimax_h3(
+@@ -855,7 +979,48 @@ def model_fn_minimax_h3(
+     timesteps[audio_pos[:ref_audio_rows_count]] = max(t_audio, audio_cond_noise_aug)
+     unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
+ 
+-    refiner_cu = torch.tensor([0, text_len, text_len], dtype=torch.int32, device=device)
++    # Token Refiner segmentation.
++    #
++    # Used to be [0, text_len, text_len] -- the whole text segment as one
++    # document, and 2 layers of full attention would mix "the head prompt +
++    # all 37 action sentences" together. The consequence: by the time A_k
++    # reaches the DiT backbone, its representation already contains
++    # information from other action sentences, **and no mask on the DiT
++    # side can close that upstream leak**, so the cut-vertex property
++    # (A_k can only reach other latents through V_k) breaks immediately.
++    #
++    # Fixed by splitting on span instead: the head is one segment, then
++    # each action sentence is its own segment. Every sentence only sees
++    # itself inside the refiner. Three things were verified:
++    #   1. head[0, head_end) and the 37 spans exactly tile [0, text_len)
++    #      with no gaps and no overlap (in _encode_action_script, cursor
++    #      accumulates from head_len one sentence at a time, and hidden is
++    #      concatenated in the same order).
++    #   2. The old duplicated text_len at the end is an **empty segment**;
++    #      _sdpa_varlen_attention hits stop == start and just continues, it
++    #      isn't a padding document -- the text segment itself has no
++    #      padding, so the new segmentation doesn't need a trailing pad either.
++    #   3. The refiner's attention uses rope_freqs=None, i.e. **it doesn't
++    #      use RoPE at all**; the DiT's positions come from img_position_ids
++    #      and are unrelated to refiner_cu. So this segmentation only
++    #      changes visibility, and doesn't touch positional encoding.
++    # Prefers the local spans written at packing time; **older caches don't
++    # have this key** (it's new in this change), so it falls back to
++    # deriving them from action_text_rows -- in the fl2va layout the text
++    # segment starts at 0, so absolute row numbers are the same as local
++    # offsets. This means the 7872 clips already cached don't need to be rebuilt.
++    spans_for_refiner = packed.get("action_text_spans_local")
++    if spans_for_refiner is None and packed.get("action_text_rows") is not None:
++        spans_for_refiner = [(int(lo), int(hi)) for lo, hi in packed["action_text_rows"]]
++    if spans_for_refiner:
++        bounds = [0, int(spans_for_refiner[0][0])]            # one segment for the head prompt
++        bounds += [int(hi) for (_, hi) in spans_for_refiner]  # one segment per action sentence
++        assert bounds[-1] == text_len, (
++            f"refiner segmentation doesn't reach the end of the text segment: {bounds[-1]} != {text_len}")
++        assert all(b < a for b, a in zip(bounds, bounds[1:])), f"refiner segmentation is not strictly increasing: {bounds}"
++        refiner_cu = torch.tensor(bounds, dtype=torch.int32, device=device)
++    else:
++        refiner_cu = torch.tensor([0, text_len, text_len], dtype=torch.int32, device=device)
+     v_video_rows, v_audio_rows = dit(
+         x=x,
+         audio_x=audio_x,
+@@ -874,6 +1039,20 @@ def model_fn_minimax_h3(
          skip_mask_out_condition=True,
          use_gradient_checkpointing=use_gradient_checkpointing,
          use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
 +        action_cond=action_cond,
-+        # video 段的起点与每帧行数。不用从 packed 透传：cond_rows_count 上面已经算过，
-+        # frame_rows 由 latent 尺寸直接得出，与 _build_packed_fl2va 里的定义一致。
++        # Start of the video segment and rows per frame. Not passed
++        # through from packed: cond_rows_count is already computed above,
++        # and frame_rows follows directly from the latent shape, matching
++        # the definition in _build_packed_fl2va.
 +        action_video_start=(int(img_pos[cond_rows_count])
 +                            if (action_cond is not None or "action_text_rows" in packed) else None),
 +        action_frame_rows=(h // 2) * (w // 2),
-+        # 逐 latent 文本条件的行区间。由 _build_packed_fl2va 在打包时算好写进 packed，
-+        # DiT 拿它建硬绑定掩码（标注 k 只与第 k 帧的 video 行互相可见）。
++        # Row spans of the per-latent text condition. Computed by
++        # _build_packed_fl2va at packing time and stored in packed; the
++        # DiT uses it to build the hard binding mask (annotation k is
++        # mutually visible only with frame k's video rows).
 +        action_text_rows=packed.get("action_text_rows"),
 +        action_real_used=packed.get("action_real_used"),
      )
  
      v_video_rows = v_video_rows[cond_rows_count:]
 diff --git a/examples/minimax_h3/model_training/train.py b/examples/minimax_h3/model_training/train.py
-index 9047ba7..61b654e 100644
+index 9047ba7..7891c87 100644
 --- a/examples/minimax_h3/model_training/train.py
 +++ b/examples/minimax_h3/model_training/train.py
 @@ -27,6 +27,9 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
@@ -642,16 +790,22 @@ index 9047ba7..61b654e 100644
          device="cpu",
          task="sft",
      ):
-@@ -60,6 +63,32 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
+@@ -60,6 +63,40 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
          )
          self.pipe.scheduler_audio.set_timesteps(1000, training=True)
  
-+        # 动作条件注入层。必须建在这里，位置有两个约束：
-+        #   - 在 from_pretrained 之后：core/loader/model.py 用 strict=True 加载预训练 DiT，
-+        #     __init__ 里凭空多出 action_embedders.* 会 Missing key(s) 报错。
-+        #   - 在 switch_pipe_to_training_mode 之后：它内部先 freeze_except 冻结一切，
-+        #     之后新建的参数默认 requires_grad=True，正好是我们要训的。
-+        # stage 1(sft:data_process) 不加载 DiT，跳过。
++        # Legacy additive/FiLM action-conditioning layers, kept for A/B
++        # comparison against the current per-latent text-injection scheme
++        # (which trains a plain LoRA and needs action_num_buttons=0, the
++        # default). Built here because of two constraints:
++        #   - after from_pretrained: core/loader/model.py loads the
++        #     pretrained DiT with strict=True, so action_embedders.* showing
++        #     up out of nowhere in __init__ would raise Missing key(s).
++        #   - after switch_pipe_to_training_mode: it calls freeze_except
++        #     first, which freezes everything; parameters created afterward
++        #     default to requires_grad=True, which is exactly what we want
++        #     for these.
++        # Stage 1 (sft:data_process) never loads the DiT, so this is skipped there.
 +        if action_num_buttons > 0 and getattr(self.pipe, "dit", None) is not None:
 +            self.pipe.dit.enable_action_conditioning(action_num_buttons, mode=action_mode)
 +            if action_mode == "film":
@@ -660,22 +814,24 @@ index 9047ba7..61b654e 100644
 +            else:
 +                action_params = list(self.pipe.dit.action_embedders.parameters())
 +            if action_train_only:
-+                # 只训动作层、冻结其余（含 LoRA）。配合零初始化，这是验证注入通路
-+                # 最干净的判据——loss 起点应与纯 LoRA baseline 重合。
++                # Train only the action layers, freeze everything else
++                # (including LoRA). Combined with zero-initialization, this
++                # is the cleanest check that the injection path works --
++                # the loss should start out matching a plain-LoRA baseline.
 +                for p in self.parameters():
 +                    p.requires_grad_(False)
 +            for p in action_params:
 +                p.requires_grad_(True)
 +            n_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-+            print(f"[action] {action_num_buttons} 键注入已启用 mode={action_mode}，"
-+                  f"动作层 {sum(p.numel() for p in action_params):,} 参数"
-+                  f"{'（action_train_only：其余全冻结）' if action_train_only else ''}，"
-+                  f"当前可训练总计 {n_trainable:,}")
++            print(f"[action] {action_num_buttons}-button injection enabled, mode={action_mode}, "
++                  f"action layers have {sum(p.numel() for p in action_params):,} parameters"
++                  f"{' (action_train_only: everything else frozen)' if action_train_only else ''}, "
++                  f"currently trainable in total: {n_trainable:,}")
 +
          # Store other configs
          self.silent_on_missing_audio = silent_on_missing_audio
          self.use_gradient_checkpointing = use_gradient_checkpointing
-@@ -140,6 +169,9 @@ def minimax_h3_parser():
+@@ -140,6 +177,9 @@ def minimax_h3_parser():
      parser.add_argument("--processor_path", type=str, default=None, help="Path or `model_id:pattern` of the Qwen3-VL processor.")
      parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
      parser.add_argument("--silent_on_missing_audio", default=False, action="store_true", help="Whether to use silent audio as a fallback when no audio track is present in the video data.")
@@ -685,7 +841,7 @@ index 9047ba7..61b654e 100644
      return parser
  
  
-@@ -190,8 +222,15 @@ if __name__ == "__main__":
+@@ -190,8 +230,15 @@ if __name__ == "__main__":
                  num_frames=args.num_frames,
                  frame_rate=MINIMAX_H3_FRAME_RATE,
              ),
@@ -702,7 +858,7 @@ index 9047ba7..61b654e 100644
      model = MiniMaxH3TrainingModule(
          model_paths=args.model_paths,
          model_id_with_origin_paths=args.model_id_with_origin_paths,
-@@ -205,6 +244,9 @@ if __name__ == "__main__":
+@@ -205,6 +252,9 @@ if __name__ == "__main__":
          preset_lora_model=args.preset_lora_model,
          use_gradient_checkpointing=args.use_gradient_checkpointing,
          use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
@@ -712,3 +868,69 @@ index 9047ba7..61b654e 100644
          extra_inputs=args.extra_inputs,
          fp8_models=args.fp8_models,
          offload_models=args.offload_models,
+diff --git a/b/examples/minimax_h3/model_training/train_v2.py b/examples/minimax_h3/model_training/train_v2.py
+new file mode 100644
+index 0000000..127418e
+--- /dev/null
++++ b/examples/minimax_h3/model_training/train_v2.py
+@@ -0,0 +1,60 @@
++#!/usr/bin/env python3
++"""Force training to actually load the v2 diffsynth, then hand control to
++the original train.py.
++
++Why this wrapper exists:
++
++  diffsynth is installed editable in this environment, which registers a
++  **MetaPathFinder** (_EditableFinder) at interpreter startup through a
++  .pth file in site-packages. Its MAPPING is hardcoded to the unmodified
++  checkout:
++
++      MAPPING = {'diffsynth': '.../DiffSynth-Studio-h3/diffsynth'}
++
++  sys.meta_path takes priority over sys.path, so **setting PYTHONPATH does
++  nothing** -- no matter what the cwd is or where PYTHONPATH points,
++  `import diffsynth` resolves to the unmodified package. And this fails
++  silently: training runs normally, just against the old code.
++
++  We hit this once already: the first attempt at training 7872_directed ran
++  for 5.2 hours (1997 steps) entirely against the old symmetric mask. The
++  logs, loss, and throughput all looked completely normal -- nothing
++  signaled the problem.
++
++Fix: before importing diffsynth, remove the editable finder and its path
++hook, insert the v2 repo root at the front of sys.path, then run the
++original train.py as __main__.
++"""
++from __future__ import annotations
++
++import runpy
++import sys
++from pathlib import Path
++
++V2_ROOT = Path(__file__).resolve().parents[3]          # .../DiffSynth-Studio-h3-v2
++
++sys.meta_path = [f for f in sys.meta_path if "Editable" not in type(f).__name__]
++sys.path_hooks = [h for h in sys.path_hooks
++                  if "Editable" not in getattr(h, "__name__", str(h))]
++sys.path_importer_cache.clear()
++sys.path.insert(0, str(V2_ROOT))
++
++# Hard verification: better to fail to start than to silently train the wrong code.
++import inspect  # noqa: E402
++
++import diffsynth.models.minimax_h3_dit as _dit  # noqa: E402
++import diffsynth.pipelines.minimax_h3_audio_video as _pipe  # noqa: E402
++
++_checks = [
++    ("diffsynth resolved from v2", "-v2/" in _dit.__file__, _dit.__file__),
++    ("directed attention mask present", "leak_out" in inspect.getsource(_dit._build_action_block_masks), ""),
++    ("packed-sequence builder is the per-latent version", "action_text_spans_local" in inspect.getsource(_pipe), ""),
++]
++for name, ok, extra in _checks:
++    print(f"[preflight] {name}: {'ok' if ok else 'FAILED'} {extra}", flush=True)
++if not all(ok for _, ok, _ in _checks):
++    sys.exit("[preflight] the loaded diffsynth is not the v2 code; refusing to start training")
++
++_real = Path(__file__).with_name("train.py")
++sys.argv[0] = str(_real)
++runpy.run_path(str(_real), run_name="__main__")

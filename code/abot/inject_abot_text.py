@@ -1,26 +1,41 @@
 #!/usr/bin/env python3
-"""把逐 latent 动作文本条件事后写进 stage 1 的 latent 缓存。
+"""Write the per-latent action-text condition into the stage-1 latent cache
+after the fact.
 
-与 inject_abot_action.py 同一套思路（事后注入、原子写、data_id = metadata 行号），
-区别是这次改写的是 **prompt_embeds + packed**，而不是加一个 action_cond：
+Same idea as an additive-conditioning injector (post-hoc, atomic write,
+data_id = metadata row number), except this one rewrites
+**prompt_embeds + packed** instead of adding an action_cond tensor:
 
-  * 视频/音频 latent 完全不动 —— 换标注方案不需要重跑 stage 1 的 VAE 编码
-  * 文本段变成 [原头部（图像 pad + 场景描述） | 37 条标注]，标注按镜像偏移落位
-  * `packed` 带出 action_text_rows / action_video_start / action_frame_rows，
-    DiT 拿它建硬绑定掩码（标注 k 只与第 k 帧的 video 行互相可见）
-  * **删除 action_cond** —— 新方案不再走 FiLM/bias 那条特征空间注入
+  * the video/audio latents are untouched -- changing the annotation scheme
+    never requires re-running stage 1's VAE encoding
+  * the text segment becomes [original head (image pad + scene prompt) |
+    37 annotation rows], with each annotation placed at a mirrored offset
+  * `packed` carries out action_text_rows / action_video_start /
+    action_frame_rows, which the DiT uses to build the hard binding mask
+    (annotation row k is only mutually visible with frame k's video rows)
+  * **action_cond is dropped** -- this scheme no longer uses the
+    FiLM/bias-style feature-space injection
 
-**头部（首帧视觉 + 场景描述）每次重新编码**，走 `presentation_fl2va(prompt, image_counts)`
-—— 与推理侧完全同一次调用，训练/推理由构造保证一致，也不依赖缓存里原有的行
-（早期版本沿用缓存行，会因为缓存被改写过而产生两种头部结构）。实测 0.25 s/条。
+**The head (first-frame vision + scene prompt) is re-encoded every time**,
+through `presentation_fl2va(prompt, image_counts)` -- the exact same call
+used at inference, so training and inference are consistent by
+construction and don't depend on whatever head happened to be in the cache
+already (an earlier version reused the cached head, which produced two
+different head structures once the cache had been rewritten once).
+Measured at 0.25 s/clip.
 
-37 条标注**逐条独立编码**，同一串永远得到同一个嵌入 —— 这既是去重字典的前提，
-也是流式推理的硬约束（推理时未来动作未知，没法整段编码）。
+The 37 annotations are **encoded independently, one at a time**: the same
+string always produces the same embedding. This is both what makes the
+dedup dictionary valid and a hard requirement for streaming inference
+(future actions are unknown at inference time, so the whole sequence can't
+be encoded together).
 
-幂等：头部每次从源数据重新编码、标注整段重建，与缓存的当前状态无关，
-所以重复运行结果稳定，中途失败直接重跑即可。
+Idempotent: the head is re-encoded from source data every run and the
+annotation segment is rebuilt from scratch, independent of the cache's
+current state, so repeated runs give the same result and a failed run can
+just be rerun.
 
-用法:
+Usage:
     python3 code/abot/inject_abot_text.py --meta data/abot_meta_train_7872.jsonl \\
         --cache output/minimax_h3_abot/7872-cache --dry-run
     python3 code/abot/inject_abot_text.py --meta ... --cache ... --device cuda:0
@@ -34,16 +49,17 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DIFFSYNTH_ROOT = Path(os.environ.get("ABOT_DIFFSYNTH_ROOT", str(PROJECT_ROOT / "DiffSynth-Studio-h3-v2")))
 CACHE_ROOT = PROJECT_ROOT / ".cache"
 for _n, _p in {
     "HF_HOME": CACHE_ROOT / "hf", "XDG_CACHE_HOME": CACHE_ROOT / "xdg",
     "TORCH_HOME": CACHE_ROOT / "torch", "TMPDIR": CACHE_ROOT / "tmp",
 }.items():
     os.environ.setdefault(_n, str(_p))
-os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = str(PROJECT_ROOT / "DiffSynth-Studio-h3" / "models")
+os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = str(DIFFSYNTH_ROOT / "models")
 os.environ["DIFFSYNTH_SKIP_DOWNLOAD"] = "True"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-sys.path.insert(0, str(PROJECT_ROOT / "DiffSynth-Studio-h3"))
+sys.path.insert(0, str(DIFFSYNTH_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np  # noqa: E402
@@ -54,11 +70,30 @@ import action_script as S  # noqa: E402
 
 LATENT_T = 37
 NUM_FRAMES = 124
-IMAGE_PAD_ROWS = 392          # 首帧过视觉塔的行数，实测在本数据集上恒定
+AUDIO_ROWS = 414              # audio_latent_t(207) * 2 channels; fixed by num_frames, independent of resolution
+
+# The three resolution-dependent quantities are all derived from
+# (HEIGHT, WIDTH) rather than hardcoded:
+#   frame_rows      rows per latent frame = (H/16/2) * (W/16/2)
+#   IMAGE_PAD_ROWS  rows the first frame takes through the vision tower = frame_rows + 2
+#                   (one vision special token before and after)
+# 480x832 -> 390 / 392, 768x1344 -> 1008 / 1010, both verified against the measured image_token_counts.
+HEIGHT = int(os.environ.get("ABOT_HEIGHT", 480))
+WIDTH = int(os.environ.get("ABOT_WIDTH", 832))
+
+
+def frame_rows_of(height: int, width: int) -> int:
+    if height % 32 or width % 32:
+        raise SystemExit(f"height and width must both be multiples of 32 (VAE 16x * patch 2x2), got {width}x{height}")
+    return (height // 32) * (width // 32)
+
+
+FRAME_ROWS = frame_rows_of(HEIGHT, WIDTH)
+IMAGE_PAD_ROWS = FRAME_ROWS + 2
 
 
 def collect_scripts(rows, clip_root: Path) -> tuple[list[list[str]], dict[str, None]]:
-    """每条样本的 37 句标注，以及去重后的词表。"""
+    """The 37 annotation sentences for every sample, plus the deduplicated vocabulary."""
     scripts, vocab = [], {}
     for r in rows:
         pooled = A.bin_to_latent(np.load(clip_root / r["action"])[:NUM_FRAMES], LATENT_T)
@@ -70,13 +105,17 @@ def collect_scripts(rows, clip_root: Path) -> tuple[list[list[str]], dict[str, N
 
 
 def scan_pad_used_to(rows, clip_root: Path, tokenizer, align: int = 64) -> tuple[int, dict]:
-    """全数据集扫一遍，算出统一的 padding 长度。
+    """Scan the whole dataset once to compute a single shared padding length.
 
-    必须统一：flex_attention 是 torch.compile 过的，每换一个序列长度就重编译一次，
-    而逐条样本的 text_len 不同，几步就会撞满 Dynamo 的重编译上限。
+    This has to be uniform: flex_attention is torch.compile'd, and every
+    distinct sequence length triggers a recompile; with a different
+    text_len per sample, this would blow past Dynamo's recompile limit
+    within a few steps.
 
-    这一步很便宜 —— head_len 只用 tokenizer 就能精确算出，不必过视觉塔和编码器：
-    presentation_fl2va = 前缀 + 图像 pad(恒定 392) + prompt，三段长度都可直接数。
+    This scan is cheap -- head_len can be computed exactly from the
+    tokenizer alone, without running the vision tower or encoder:
+    presentation_fl2va = prefix + image pad (constant 392) + prompt, and
+    all three segment lengths can be counted directly.
     """
     from diffsynth.models.minimax_h3_text_encoder import presentation_fl2va
 
@@ -91,8 +130,8 @@ def scan_pad_used_to(rows, clip_root: Path, tokenizer, align: int = 64) -> tuple
                 ann_len[line] = len(tokenizer(line)["input_ids"])
         head = prefix + IMAGE_PAD_ROWS + len(tokenizer(r["prompt"])["input_ids"])
         text_len = head + sum(ann_len[x] for x in script)
-        # cond / audio / video 的行数由 latent 尺寸决定，本数据集恒定
-        used = text_len + 390 + 414 + LATENT_T * 390
+        # the cond / audio / video row counts are fixed by the latent shape, constant across this dataset
+        used = text_len + FRAME_ROWS + AUDIO_ROWS + LATENT_T * FRAME_ROWS
         stats["used"].append(used)
         stats["text_len"].append(text_len)
     mx = max(stats["used"])
@@ -100,7 +139,7 @@ def scan_pad_used_to(rows, clip_root: Path, tokenizer, align: int = 64) -> tuple
 
 
 def load_encoder(device: str, dtype=torch.bfloat16):
-    """只加载 text_encoder + processor，不碰 DiT / VAE。"""
+    """Load only the text_encoder + processor, leaving the DiT and VAE untouched."""
     from diffsynth.pipelines.minimax_h3_audio_video import MiniMaxH3Pipeline, ModelConfig
 
     cfg = dict(offload_dtype=dtype, offload_device="cpu", onload_dtype=dtype,
@@ -119,7 +158,7 @@ def load_encoder(device: str, dtype=torch.bfloat16):
 
 
 def encode_vocab(pipe, vocab, device: str, dtype=torch.bfloat16) -> dict[str, torch.Tensor]:
-    """标注逐条**独立**编码：同一串永远得到同一个嵌入。"""
+    """Encode each annotation **independently**: the same string always produces the same embedding."""
     from diffsynth.models.minimax_h3_text_encoder import presentation_t2va
     out = {}
     for i, line in enumerate(vocab):
@@ -129,17 +168,19 @@ def encode_vocab(pipe, vocab, device: str, dtype=torch.bfloat16) -> dict[str, to
             h = pipe.text_encoder(input_ids=ids, attention_mask=torch.ones_like(ids))
         out[line] = h.to("cpu", dtype)
         if (i + 1) % 20 == 0 or i + 1 == len(vocab):
-            print(f"    编码 {i + 1}/{len(vocab)}", flush=True)
+            print(f"    encoded {i + 1}/{len(vocab)}", flush=True)
     return out
 
 
-def encode_head(pipe, row, clip_root: Path, device: str, height=480, width=832):
-    """首帧视觉 + 场景描述，走与推理侧同一次 presentation_fl2va 调用。"""
+def encode_head(pipe, row, clip_root: Path, device: str, height=None, width=None):
+    """First-frame vision + scene prompt, through the same presentation_fl2va call used at inference."""
     import imageio.v2 as iio
     from PIL import Image
     from diffsynth.models.minimax_h3_text_encoder import presentation_fl2va
     from diffsynth.pipelines.minimax_h3_audio_video import image_token_counts
 
+    height = HEIGHT if height is None else height
+    width = WIDTH if width is None else width
     reader = iio.get_reader(str(clip_root / row["video"]), "ffmpeg")
     frame = Image.fromarray(reader.get_data(0)); reader.close()
     frame = frame.convert("RGB").resize((width, height), Image.LANCZOS)
@@ -183,8 +224,8 @@ def rewrite_one(path: str, script: list[str], head, emb: dict[str, torch.Tensor]
         text_len, lt, lh, lw, audio_t, keyframe_indices,
         action_text_spans=spans, pad_used_to=pad_used_to)
     tt = new_packed["token_tags"]
-    tt[new_packed["text_pos"]] = 1                         # 标注行都是文本
-    tt[new_packed["text_pos"][:head_len]] = head_tags      # 头部沿用原标签（图像 pad 走 video 组）
+    tt[new_packed["text_pos"]] = 1                         # every annotation row is text
+    tt[new_packed["text_pos"][:head_len]] = head_tags      # the head keeps its original tags (image pad goes in the video group)
 
     stat = {"text_len": text_len, "seq_len": int(new_packed["seq_len"]),
             "head_len": head_len, "n_img": int((head_tags == 0).sum()),
@@ -195,7 +236,7 @@ def rewrite_one(path: str, script: list[str], head, emb: dict[str, torch.Tensor]
 
     extra["prompt_embeds"] = new_pe
     extra["packed"] = new_packed
-    kwargs.pop("action_cond", None)                        # 新方案不走特征空间注入
+    kwargs.pop("action_cond", None)                        # this scheme no longer uses feature-space injection
     tmp = path + f".tmp.{os.getpid()}"
     torch.save(data, tmp)
     os.replace(tmp, path)
@@ -203,18 +244,26 @@ def rewrite_one(path: str, script: list[str], head, emb: dict[str, torch.Tensor]
 
 
 def main() -> None:
+    global HEIGHT, WIDTH, FRAME_ROWS, IMAGE_PAD_ROWS
     ap = argparse.ArgumentParser()
     ap.add_argument("--meta", required=True)
     ap.add_argument("--cache", required=True)
     ap.add_argument("--clip-root", default=str(PROJECT_ROOT / "data/clips"))
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--shard", type=int, default=0, help="第几个分片（0 起）")
-    ap.add_argument("--num-shards", type=int, default=1, help="总分片数；8 卡并行填 8")
-    ap.add_argument("--limit", type=int, default=None, help="只处理前 N 条，用于验证")
+    ap.add_argument("--shard", type=int, default=0, help="which shard, 0-indexed")
+    ap.add_argument("--num-shards", type=int, default=1, help="total shard count; use 8 for 8-GPU parallel")
+    ap.add_argument("--limit", type=int, default=None, help="only process the first N rows, for verification")
     ap.add_argument("--pad-used-to", type=int, default=None,
-                    help="统一的 padding 长度；不给则自动扫全数据集算出（推荐）")
-    ap.add_argument("--dry-run", action="store_true", help="只算不写")
+                    help="shared padding length; if omitted, scans the whole dataset to compute it (recommended)")
+    ap.add_argument("--dry-run", action="store_true", help="compute only, don't write")
+    ap.add_argument("--height", type=int, default=HEIGHT, help="training height, must be a multiple of 32")
+    ap.add_argument("--width", type=int, default=WIDTH, help="training width, must be a multiple of 32")
     args = ap.parse_args()
+
+    HEIGHT, WIDTH = args.height, args.width
+    FRAME_ROWS = frame_rows_of(HEIGHT, WIDTH)
+    IMAGE_PAD_ROWS = FRAME_ROWS + 2
+    print(f"resolution {WIDTH}x{HEIGHT} -> frame_rows {FRAME_ROWS}, image pad {IMAGE_PAD_ROWS} rows")
 
     meta = Path(args.meta)
     if not meta.is_absolute():
@@ -228,31 +277,31 @@ def main() -> None:
             if fn.endswith(".pth"):
                 did = int(fn[:-4])
                 if did in pth:
-                    sys.exit(f"重复 data_id {did}")
+                    sys.exit(f"duplicate data_id {did}")
                 pth[did] = os.path.join(root, fn)
     ids = sorted(pth)
     if args.limit:
         ids = ids[: args.limit]
     for did in ids:
         if did >= len(rows):
-            sys.exit(f"data_id {did} 超出 metadata 行数 {len(rows)}")
+            sys.exit(f"data_id {did} exceeds the {len(rows)} metadata rows")
     ids = ids[args.shard::args.num_shards]
     tag = f"[{args.shard}/{args.num_shards}] " if args.num_shards > 1 else ""
-    print(f"{tag}metadata {len(rows)} 行，缓存 {len(pth)} 条，本分片 {len(ids)} 条")
+    print(f"{tag}metadata has {len(rows)} rows, cache has {len(pth)} entries, this shard: {len(ids)}")
 
     scripts, vocab = collect_scripts([rows[i] for i in ids], clip_root)
-    print(f"{tag}标注词表 {len(vocab)} 种")
+    print(f"{tag}annotation vocabulary: {len(vocab)} distinct sentences")
 
     pipe = load_encoder(args.device)
     pad_used_to = args.pad_used_to
     if pad_used_to is None:
-        # 注意：要扫**全部** ids（不是本分片），否则各分片算出的值不一致
+        # Important: scan **all** ids, not just this shard, or different shards would compute different values.
         all_ids = sorted(pth)[: args.limit] if args.limit else sorted(pth)
         pad_used_to, sc = scan_pad_used_to([rows[i] for i in all_ids], clip_root, pipe.tokenizer)
-        print(f"{tag}统一 padding: used {min(sc['used'])}–{max(sc['used'])} -> {pad_used_to}")
+        print(f"{tag}shared padding: used {min(sc['used'])}-{max(sc['used'])} -> {pad_used_to}")
     emb = encode_vocab(pipe, vocab, args.device)
     lens = [int(v.shape[0]) for v in emb.values()]
-    print(f"{tag}单条标注 {min(lens)}–{max(lens)} 行（均值 {sum(lens) / len(lens):.1f}）")
+    print(f"{tag}per-annotation length {min(lens)}-{max(lens)} rows (mean {sum(lens) / len(lens):.1f})")
 
     from diffsynth.pipelines.minimax_h3_audio_video import (
         MiniMaxH3Unit_PackedSequenceBuilder as U)
@@ -264,19 +313,19 @@ def main() -> None:
         stats.append(rewrite_one(pth[did], sc, head, emb, builder, args.dry_run,
                                  pad_used_to=pad_used_to))
         if (n + 1) % 100 == 0 or n + 1 == len(ids):
-            print(f"{tag}  {'试算' if args.dry_run else '写入'} {n + 1}/{len(ids)}", flush=True)
+            print(f"{tag}  {'dry-run' if args.dry_run else 'written'} {n + 1}/{len(ids)}", flush=True)
 
     tl = np.array([s["text_len"] for s in stats])
     sl = np.array([s["seq_len"] for s in stats])
     hl = np.array([s["head_len"] for s in stats])
     osl = np.array([s["old_seq_len"] for s in stats])
-    print(f"\n{tag}head_len {hl.min()}–{hl.max()}（重新编码，其中图像 pad {stats[0]['n_img']} 行）")
-    print(f"{tag}text_len {tl.min()}–{tl.max()}（均值 {tl.mean():.0f}）")
+    print(f"\n{tag}head_len {hl.min()}-{hl.max()} (re-encoded, of which {stats[0]['n_img']} rows are image pad)")
+    print(f"{tag}text_len {tl.min()}-{tl.max()} (mean {tl.mean():.0f})")
     ru = np.array([s["real_used"] for s in stats])
-    print(f"{tag}real_used {ru.min()}–{ru.max()}  ->  统一 padding 到 {pad_used_to}")
-    print(f"{tag}seq_len  {osl.min()}–{osl.max()} -> {sl.min()}–{sl.max()}"
-          f"（唯一值 {sorted(set(sl.tolist()))}）")
-    print(f"{tag}" + ("试算完成，未写盘" if args.dry_run else "写入完成，action_cond 已删除"))
+    print(f"{tag}real_used {ru.min()}-{ru.max()}  ->  padded to a shared {pad_used_to}")
+    print(f"{tag}seq_len  {osl.min()}-{osl.max()} -> {sl.min()}-{sl.max()}"
+          f" (distinct values: {sorted(set(sl.tolist()))})")
+    print(f"{tag}" + ("dry run complete, nothing written" if args.dry_run else "write complete, action_cond removed"))
 
 
 if __name__ == "__main__":

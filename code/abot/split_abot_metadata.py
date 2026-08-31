@@ -43,9 +43,11 @@ def main() -> None:
     parser.add_argument(
         "--fixed-test",
         default=None,
-        help="沿用已有测试集：从这个 jsonl 读 sample_id，把它们全部划为测试、其余为训练。"
-             "扩数据时必须用它 —— hash 选法只对固定的输入集合稳定，输入从 16000 变成 "
-             "20128 之后同一个 seed 会选出**不同的** 128 条，导致新训练集里混进旧测试样本。",
+        help="Reuse an existing test split: read sample_id from this jsonl, mark them all "
+             "as test, everything else as train. Required when the dataset grows -- the "
+             "hash-based selection is only stable for a fixed input set; if the input goes "
+             "from 16000 to 20128 rows, the same seed picks a **different** set of 128 rows, "
+             "leaking old test samples into the new training set.",
     )
     args = parser.parse_args()
 
@@ -64,9 +66,9 @@ def main() -> None:
         missing = keep - set(ids)
         if missing:
             raise SystemExit(
-                f"--fixed-test 里有 {len(missing)} 条不在 input 中，例: {sorted(missing)[:3]}")
+                f"--fixed-test has {len(missing)} rows not present in input, e.g. {sorted(missing)[:3]}")
         test_indices = {i for i, sid in enumerate(ids) if sid in keep}
-        print(f"沿用固定测试集 {args.fixed_test}：{len(test_indices)} 条")
+        print(f"reusing fixed test split {args.fixed_test}: {len(test_indices)} rows")
     else:
         test_indices = set(sorted(range(len(rows)),
                                   key=lambda i: stable_score(ids[i], args.seed))[:args.test_size])
