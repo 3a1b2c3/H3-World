@@ -868,7 +868,7 @@ index 9047ba7..7891c87 100644
          extra_inputs=args.extra_inputs,
          fp8_models=args.fp8_models,
          offload_models=args.offload_models,
-diff --git a/b/examples/minimax_h3/model_training/train_v2.py b/examples/minimax_h3/model_training/train_v2.py
+diff --git a/examples/minimax_h3/model_training/train_v2.py b/examples/minimax_h3/model_training/train_v2.py
 new file mode 100644
 index 0000000..127418e
 --- /dev/null
