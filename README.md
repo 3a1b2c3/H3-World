@@ -11,7 +11,7 @@ become one short English sentence per latent frame, injected through the text
 channel the model was already pretrained on, and bound to the right frame by a
 directed attention mask. Only a rank-32 LoRA on `qkv_proj`/`out_proj` is trained.
 
-**Checkpoint**: [DANNY621/H3-World-results](https://huggingface.co/DANNY621/H3-World-results) on Hugging Face.
+<a href="https://huggingface.co/DANNY621/H3-World-results"><img src="https://img.shields.io/badge/🤗_HuggingFace-Model-ffbd45.svg" alt="HuggingFace Model"></a>
 
 ## Demo
 
