@@ -11,6 +11,8 @@ become one short English sentence per latent frame, injected through the text
 channel the model was already pretrained on, and bound to the right frame by a
 directed attention mask. Only a rank-32 LoRA on `qkv_proj`/`out_proj` is trained.
 
+**Checkpoint**: [DANNY621/H3-World-results](https://huggingface.co/DANNY621/H3-World-results) on Hugging Face.
+
 ## Demo
 
 https://github.com/user-attachments/assets/fa6e5961-7ed6-4263-ad04-71c4c9953851
@@ -28,7 +30,6 @@ Three chapters, each with the driving action prompt on screen:
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Training](#training)
-- [Docs](#docs)
 
 ## How it works
 
@@ -89,8 +90,6 @@ independent 17-frame clips. That gives the frame grouping `1,4,4,4,4` per clip:
 ```
 
 Hence `num_frames` must be `17k + 5`: 124 (5.2 s), 243 (10.1 s), 481 (20.0 s).
-
-Full diagrams: [action_injection_arch.html](docs/action_injection_arch.html).
 
 ## Results
 
@@ -200,9 +199,9 @@ python3 code/abot/infer.py \
 
 `--action-preset` covers the basic single-combination vocabulary (`still`,
 `forward`, `back`, `strafe-left`, `strafe-right`, `tilt-up`, `tilt-down`,
-`pan-left`, `pan-right`, `pan-left-fast`, `pan-right-fast`); see
-[action_injection_arch.html](docs/action_injection_arch.html) for the full key ->
-sentence rule table, including compound actions.
+`pan-left`, `pan-right`, `pan-left-fast`, `pan-right-fast`); the full key ->
+sentence rule table, including compound actions, is in
+[`code/abot/action_script.py`](code/abot/action_script.py).
 
 ## Training
 
@@ -218,15 +217,6 @@ attention mask against the same data: the script `cd`s into
 `DiffSynth-Studio-h3-v2`, and its entry point (`train_v2.py`) strips the
 editable-install finder before importing diffsynth and runs three hard
 preflight checks -- see "Installation" above for why that finder is a problem.
-
-## Docs
-
-| Document | What it covers |
-|---|---|
-| [action_injection_arch.html](docs/action_injection_arch.html) | Architecture diagrams: keys -> text, sequence layout, the binding mask |
-| [journey.md](docs/journey.md) | How this was actually built, including earlier approaches that were tried and replaced |
-| [longer_video.md](docs/longer_video.md) | Generating beyond 5.2 s |
-| [pipeline_text_injection.md](docs/pipeline_text_injection.md) | The text-injection scheme, end to end |
 
 ## Acknowledgements
 
