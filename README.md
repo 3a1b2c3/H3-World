@@ -220,3 +220,16 @@ preflight checks -- see "Installation" above for why that finder is a problem.
 - [MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3) -- the base model
 - [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) -- the training framework
 - [ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h) -- the gameplay data
+
+## 🔗 Citation
+```
+@misc{chen2026h3worldturninglanguageunderstanding,
+      title={H3-World: Turning Language Understanding into World Control}, 
+      author={Danze Chen and Zeqing Wang and Ziyue Lin and Xingyi Yang and Yeying Jin},
+      year={2026},
+      eprint={2609.01560},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2609.01560}, 
+}
+```
