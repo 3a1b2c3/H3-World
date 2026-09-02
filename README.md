@@ -6,11 +6,6 @@ should produce a different -- and *correct* -- motion. Built by fine-tuning
 [ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h)
 gameplay footage.
 
-The condition path adds **zero action-specific trainable modules**. Key presses
-become one short English sentence per latent frame, injected through the text
-channel the model was already pretrained on, and bound to the right frame by a
-directed attention mask. Only a rank-32 LoRA on `qkv_proj`/`out_proj` is trained.
-
 <a href="https://huggingface.co/DANNY621/H3-World-results"><img src="https://img.shields.io/badge/🤗_HuggingFace-Model-ffbd45.svg" alt="HuggingFace Model"></a>
 
 ## Demo
