@@ -2,8 +2,10 @@
 # Install H3-World's environment and run the README's example inference
 # command. Model weights are downloaded by the separate download_models.sh
 # (called below unless --skip-download). Deviates from the README in one
-# way: uses `uv venv --python 3.10` + `uv pip install` instead of conda, for
-# the same Python 3.10 pin without needing conda installed.
+# way: uses a plain `python3 -m venv` + pip instead of conda -- whatever
+# python3 is already on PATH, not pinned to 3.10 like the README's conda
+# instructions (README notes it was "tested with Python 3.10", not that
+# other versions are known broken).
 #
 #   bash setup_and_run.sh              # install + download + run the example
 #   bash setup_and_run.sh --skip-install   # already installed, just download+run
@@ -29,22 +31,23 @@ echo
 
 if [ "$SKIP_INSTALL" = "0" ]; then
   echo "--- Installing environment ---"
-  if ! command -v uv >/dev/null 2>&1; then
-    echo "ERROR: uv is not installed. Install it first: https://docs.astral.sh/uv/" >&2
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 is not on PATH." >&2
     exit 1
   fi
 
   if [ ! -d "$REPO_ROOT/.venv" ]; then
-    uv venv --python 3.10 "$REPO_ROOT/.venv"
+    python3 -m venv "$REPO_ROOT/.venv"
   fi
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.venv/bin/activate"
+  pip install --upgrade pip
 
   echo "Installing torch (cu132 -- README says cu128, using cu132 for this box's CUDA 13.2)..."
-  uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu132
+  pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu132
 
   echo "Installing requirements.txt..."
-  uv pip install -r requirements.txt
+  pip install -r requirements.txt
 
   if [ ! -d "$REPO_ROOT/DiffSynth-Studio-h3-v2" ]; then
     echo "Cloning DiffSynth-Studio at the pinned commit..."
