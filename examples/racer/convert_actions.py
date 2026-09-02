@@ -22,12 +22,21 @@ of this synthetic clip, not a bug: there is no way to recover true turn
 speed from discrete move/view labels alone.
 
 Output: examples/racer/actions.npy, shape [num_frames, 17], float32.
-num_frames is the largest value <= len(0001.json) satisfying H3's
-(num_frames - 5) % 17 == 0 constraint (see abot_action.py's latent_t_for) --
-printed so it can be passed to infer.py's --num-frames.
+num_frames is the largest value <= min(len(0001.json), --max-frames)
+satisfying H3's (num_frames - 5) % 17 == 0 constraint (see
+abot_action.py's latent_t_for) -- printed so it can be passed to infer.py's
+--num-frames.
 
-Run: python3 examples/racer/convert_actions.py
+--max-frames matters for real: CONFIRMED on real hardware that the full
+1382-frame clip OOMs even on a 249 GiB GPU -- the DiT's action-block-mask
+construction (_build_action_block_masks -> create_block_mask) allocates a
+dense [length, length] tensor that scales with sequence length, tried to
+allocate 209.81 GiB for the full clip. Default here (124) matches the
+README's own standard example, already confirmed to fit.
+
+Run: python3 examples/racer/convert_actions.py [--max-frames N]
 """
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -38,11 +47,19 @@ CODE_ABOT = Path(__file__).resolve().parents[2] / "code" / "abot"
 sys.path.insert(0, str(CODE_ABOT))
 import abot_action as A  # noqa: E402
 
+ap = argparse.ArgumentParser()
+ap.add_argument("--max-frames", type=int, default=124,
+                help="cap on num_frames, must be 17k+5 -- see module docstring for why "
+                     "this defaults to 124 instead of using the full clip")
+args = ap.parse_args()
+if (args.max_frames - 5) % 17:
+    ap.error(f"--max-frames must be 17k+5 (124, 243, 481, ...), got {args.max_frames}")
+
 racer_dir = Path(__file__).parent
 actions = json.loads((racer_dir / "0001.json").read_text())
 
-# Largest num_frames <= len(actions) satisfying (n - 5) % 17 == 0.
-n = len(actions)
+# Largest num_frames <= min(len(actions), args.max_frames) satisfying (n - 5) % 17 == 0.
+n = min(len(actions), args.max_frames)
 n = n - ((n - 5) % 17)
 if n < 5:
     raise ValueError(f"0001.json has too few ticks ({len(actions)}) for even one valid --num-frames")

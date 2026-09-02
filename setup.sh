@@ -29,34 +29,32 @@ fi
 source "$REPO_ROOT/.venv/bin/activate"
 pip install --upgrade pip
 
-echo "Installing torch (cu132 stable, pinned per README) + torchvision..."
-# --force-reinstall: CONFIRMED on real hardware -- plain `pip install
-# torch==2.10.0` can read as "already satisfied" against a stray CPU-only
-# torch left over from an earlier troubleshooting attempt (pip's `==2.10.0`
-# constraint doesn't distinguish local build tags like +cu132 vs +cpu), and
-# silently keep the CPU build instead of replacing it. Symptom: "Torch not
-# compiled with CUDA enabled" at generation time, not at install time.
-pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu132 --force-reinstall
+echo "Installing torch (cu132, unpinned)..."
+# CONFIRMED on real hardware: torch==2.10.0 (the README's pinned version)
+# does NOT exist on the cu132 index at all (versions jump 2.0.x -> 2.12.x+)
+# -- pinning to it silently fell back to a CPU-only build, not an error.
+# Unpinned here so pip picks whatever torch version cu132 actually has.
+# --force-reinstall: a stray CPU-only torch from an earlier troubleshooting
+# attempt can read as "already satisfied" and never get replaced without
+# this (pip's version matching doesn't distinguish +cu132 vs +cpu local
+# build tags). Symptom if this ever regresses: "Torch not compiled with
+# CUDA enabled" at generation time, not at install time.
+pip install torch --index-url https://download.pytorch.org/whl/cu132 --force-reinstall
 
-echo "Installing torchaudio (CPU-only)..."
-# torchaudio isn't in the README's install steps at all, but
-# DiffSynth-Studio-h3-v2's diffsynth/utils/data/audio.py imports it
-# unconditionally (same transitive-import situation as pandas below) --
-# only for basic format utilities (convert_to_stereo/resample_waveform),
-# not GPU compute, so CPU-only is fine here. CONFIRMED on real hardware:
-# the stable cu132 index has no torchaudio build matching
-# torch==2.10.0+cu132's ABI -- pip silently resolved a mismatched GPU
-# build, which failed to load its compiled extension (_torchaudio.abi3.so
-# couldn't find libc10_cuda.so). The CPU wheel sidesteps that entirely
-# (no libc10_cuda.so dependency at all) instead of needing a matched
-# torch/torchvision/torchaudio nightly triplet.
-# --force-reinstall: CONFIRMED on real hardware that plain `pip install`
-# here is not enough -- .venv is reused across runs (not recreated if it
-# already exists), so a stale mismatched-GPU-build torchaudio from an
-# earlier attempt reads as "already satisfied" and never gets replaced
-# without this. --no-deps avoids pip also pulling in a CPU-only torch and
-# clobbering the working CUDA torch install above.
-pip install torchaudio --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps
+echo "Installing torchvision + torchaudio (CPU-only)..."
+# Neither is in the README's install steps at all, but
+# DiffSynth-Studio-h3-v2 imports torchaudio unconditionally (see
+# diffsynth/utils/data/audio.py) for basic format utilities (not GPU
+# compute), and torchvision is used similarly here -- CPU-only sidesteps
+# needing an exact-matching CUDA build for either, which the cu132 index
+# doesn't reliably have (see the torch note above). --no-deps on both:
+# without it, pip would each try to pull in their own CPU-only torch
+# dependency and clobber the working CUDA torch installed above.
+# --force-reinstall: same stale-reinstall reasoning as torch above --
+# .venv is reused across runs, so a leftover mismatched-GPU-build
+# torchvision/torchaudio from an earlier attempt won't get replaced
+# without it.
+pip install torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps
 
 echo "Installing requirements.txt..."
 pip install -r requirements.txt

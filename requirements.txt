@@ -1,6 +1,10 @@
 # Pinned from the working environment (CUDA 12.8).
-# torch is installed separately from the cu128 index — see README.
-torchvision==0.25.0
+# torch (pinned, cu132) + torchvision are installed separately in
+# setup_and_run.sh; torchaudio too, from the CPU wheel index specifically
+# (only needed for format utilities, not GPU compute -- see that script's
+# comment for why a GPU torchaudio build broke here). None of the three are
+# listed here, since `pip install -r requirements.txt` would otherwise
+# reinstall a stable torchvision pin and risk ABI mismatch again.
 accelerate==1.14.0
 transformers==4.57.3
 safetensors==0.7.0
