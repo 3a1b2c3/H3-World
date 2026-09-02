@@ -8,7 +8,7 @@ gameplay footage.
 
 <a href="https://huggingface.co/DANNY621/H3-World-results"><img src="https://img.shields.io/badge/🤗_HuggingFace-Model-ffbd45.svg" alt="HuggingFace Model"></a>
 <a href="https://github.com/Danzer1xxxxChan/H3-World"><img src="https://img.shields.io/badge/Web-Project Page-1d72b8.svg" alt="Project Page"></a>
-<a href="https://arxiv.org/abs/2609.01560"><img src="https://img.shields.io/badge/arXiv-H3-World-A42C25.svg" alt="arXiv"></a>
+
 
 ## Demo
 
