@@ -51,6 +51,20 @@ python3 code/abot/infer.py \
   --cfg-scale 1.0 \
   --out outputs/example_forward.mp4
 echo "Done. Output: outputs/example_forward.mp4"
+
+echo "Building key overlay for the forward-preset example..."
+python3 -c "
+import sys
+sys.path.insert(0, 'examples')
+import numpy as np
+from overlay_keys import build_keys9_from_preset
+np.save('outputs/example_forward_actions.npy', build_keys9_from_preset(('W',), 124))
+"
+python3 examples/overlay_keys.py \
+  --video outputs/example_forward.mp4 \
+  --actions outputs/example_forward_actions.npy \
+  --out outputs/example_forward_overlay.mp4
+echo "Done. Output: outputs/example_forward_overlay.mp4"
 echo
 
 echo "--- Running racer example (real per-frame action sequence, not a preset) ---"
@@ -72,6 +86,15 @@ python3 code/abot/infer.py \
   --steps 50 \
   --cfg-scale 1.0 \
   --out outputs/example_racer.mp4
+echo "Done. Output: outputs/example_racer.mp4"
+
+echo "Building key overlay for the racer example..."
+python3 examples/overlay_keys.py \
+  --video outputs/example_racer.mp4 \
+  --actions examples/racer/actions.npy \
+  --out outputs/example_racer_overlay.mp4
+echo "Done. Output: outputs/example_racer_overlay.mp4"
 
 echo
-echo "Done. Outputs: outputs/example_forward.mp4, outputs/example_racer.mp4"
+echo "Done. Outputs: outputs/example_forward.mp4, outputs/example_forward_overlay.mp4,"
+echo "               outputs/example_racer.mp4, outputs/example_racer_overlay.mp4"
