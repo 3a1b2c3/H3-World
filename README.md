@@ -1,12 +1,12 @@
-# 🎮 H3-World: Turning Language Understanding into World Control
-
-https://github.com/user-attachments/assets/1c862995-8809-447e-bade-2c47bfdb2738
+# H3-World: Turning Language Understanding into World Control
 
 H3-World is the **first interactive world model** built on [MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3). It generates action-controlled video from an initial frame by converting keyboard states into per-latent language instructions and binding each instruction to its corresponding future video latent through directed attention routing. Using 8,000 gameplay clips from [ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h), H3-World learns 65.6M LoRA parameters, only 0.199% of the 33B backbone.
 
 <a href="https://arxiv.org/abs/2609.01560"><img src="https://img.shields.io/badge/arXiv-H3--World-A42C25.svg" alt="arXiv"></a>
 <a href="https://huggingface.co/DANNY621/H3-World"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-ffbd45.svg" alt="Hugging Face model"></a>
 <a href="https://danzer1xxxxchan.github.io/H3-World"><img src="https://img.shields.io/badge/Web-Project%20Page-1d72b8.svg" alt="Project page"></a>
+
+https://github.com/user-attachments/assets/1c862995-8809-447e-bade-2c47bfdb2738
 
 > **H3-World: Turning Language Understanding into World Control**<br>
 > Danze Chen<sup>1,2</sup>, Zeqing Wang<sup>1,2</sup>, Ziyue Lin<sup>3</sup>, [Xingyi Yang](https://adamdad.github.io/)<sup>3</sup>, [Yeying Jin](https://jinyeying.github.io/)<sup>1,2</sup><br>
