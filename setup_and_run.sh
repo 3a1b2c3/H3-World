@@ -82,7 +82,7 @@ else
   echo
 fi
 
-echo "--- Running example inference ---"
+echo "--- Running example inference (README's forward-preset example) ---"
 mkdir -p outputs
 python3 code/abot/infer.py \
   --checkpoint checkpoints/H3-World/step-10000.safetensors \
@@ -94,6 +94,28 @@ python3 code/abot/infer.py \
   --num-frames 124 \
   --cfg-scale 1.0 \
   --out outputs/example_forward.mp4
+echo "Done. Output: outputs/example_forward.mp4"
+echo
+
+echo "--- Running racer example (real per-frame action sequence, not a preset) ---"
+echo "Converting examples/racer/0001.json -> examples/racer/actions.npy..."
+CONVERT_OUT=$(python3 examples/racer/convert_actions.py)
+echo "$CONVERT_OUT"
+RACER_NUM_FRAMES=$(echo "$CONVERT_OUT" | grep -- '--num-frames' | awk '{print $2}')
+if [ -z "$RACER_NUM_FRAMES" ]; then
+  echo "ERROR: could not parse --num-frames out of convert_actions.py's output" >&2
+  exit 1
+fi
+python3 code/abot/infer.py \
+  --checkpoint checkpoints/H3-World/step-10000.safetensors \
+  --first-frame examples/racer/Screenshot.png \
+  --scene-prompt "$(cat examples/racer/prompt.txt)" \
+  --action-file examples/racer/actions.npy \
+  --num-frames "$RACER_NUM_FRAMES" \
+  --seed 2 \
+  --steps 50 \
+  --cfg-scale 1.0 \
+  --out outputs/example_racer.mp4
 
 echo
-echo "Done. Output: outputs/example_forward.mp4"
+echo "Done. Outputs: outputs/example_forward.mp4, outputs/example_racer.mp4"

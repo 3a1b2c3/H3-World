@@ -145,7 +145,14 @@ def main() -> None:
     ap.add_argument("--first-frame", required=True, type=Path, help="image used as the generation's first frame")
     ap.add_argument("--scene-prompt", required=True, help="scene description prefixed to the action clauses")
     ap.add_argument("--action-preset", choices=sorted(ACTION_PRESETS), default="forward",
-                    help="held key combination for the whole clip (default: forward)")
+                    help="held key combination for the whole clip (default: forward). "
+                         "Ignored if --action-file is given.")
+    ap.add_argument("--action-file", type=Path, default=None,
+                    help="raw per-frame action matrix (.npy, shape [num_frames, 17], "
+                         "abot_action.ACTION_DIM layout) for a varying-over-time action "
+                         "sequence instead of one constant preset -- see "
+                         "examples/racer/convert_actions.py for how to build one. "
+                         "--num-frames must match the matrix's first dimension exactly.")
     ap.add_argument("--num-frames", type=int, default=NUM_FRAMES, help="must be 17k+5")
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--seed", type=int, default=0)
@@ -158,12 +165,31 @@ def main() -> None:
         ap.error(f"--num-frames must be 17k+5 (124, 243, 481, ...), got {args.num_frames}")
     latent_t = A.latent_t_for(args.num_frames)
 
-    keys9 = np.zeros((latent_t, len(S.KEYS9)), dtype=np.int64)
-    for key in ACTION_PRESETS[args.action_preset]:
-        keys9[:, S.KEYS9.index(key)] = 1
-    script = S.annotate_from_keys9(keys9)
-    print(f"action: {args.action_preset}  ({keys9[0].tolist()})")
-    print(f"first latent's sentence: {script[0]}")
+    if args.action_file is not None:
+        # Varying-over-time action sequence -- run the SAME real pipeline
+        # training data goes through (bin_to_latent -> keys9 -> annotate),
+        # not the constant-preset shortcut below, so a per-frame recording
+        # produces genuinely per-latent-varying text instead of one frozen
+        # sentence repeated for the whole clip.
+        raw = np.load(args.action_file)
+        if raw.shape[0] != args.num_frames:
+            ap.error(f"--action-file has {raw.shape[0]} frames, but --num-frames is "
+                      f"{args.num_frames} -- they must match exactly.")
+        if raw.shape[1] != A.ACTION_DIM:
+            ap.error(f"--action-file has {raw.shape[1]} columns, expected {A.ACTION_DIM} "
+                      f"(abot_action.ACTION_DIM: {A.ACTION_COLS})")
+        pooled = A.bin_to_latent(raw, latent_t)
+        keys9 = S.keys9(pooled)
+        script = S.annotate_from_keys9(keys9)
+        print(f"action: --action-file {args.action_file}  ({keys9[0].tolist()})")
+        print(f"first latent's sentence: {script[0]}")
+    else:
+        keys9 = np.zeros((latent_t, len(S.KEYS9)), dtype=np.int64)
+        for key in ACTION_PRESETS[args.action_preset]:
+            keys9[:, S.KEYS9.index(key)] = 1
+        script = S.annotate_from_keys9(keys9)
+        print(f"action: {args.action_preset}  ({keys9[0].tolist()})")
+        print(f"first latent's sentence: {script[0]}")
 
     lora_state = load_checkpoint_lora(args.checkpoint)
     lora_pairs = sum(1 for k in lora_state if ".lora_A." in k)
