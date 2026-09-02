@@ -13,11 +13,12 @@ gameplay footage.
 </a>
 
 
-
-
-## Demo
-
 https://github.com/user-attachments/assets/1c862995-8809-447e-bade-2c47bfdb2738
+
+
+> **H3-World: Turning Language Understanding into World Control**    
+> Danze Chen<sup>12</sup>, Zeqing Wang<sup>12</sup>, Ziyue Lin<sup>3</sup>, [Xingyi Yang](https://adamdad.github.io/)<sup>3</sup> , [Yeying Jin](https://jinyeying.github.io/)<sup>12</sup>  
+> <sup>1</sup> Tencent, <sup>2</sup> National University of Singapore, <sup>3</sup> The Hong Kong Polytechnic University
 
 
 ## Contents
