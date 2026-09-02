@@ -15,13 +15,8 @@ directed attention mask. Only a rank-32 LoRA on `qkv_proj`/`out_proj` is trained
 
 ## Demo
 
-https://github.com/user-attachments/assets/fa6e5961-7ed6-4263-ad04-71c4c9953851
+https://github.com/user-attachments/assets/cc2b1099-cc67-407f-8824-e4cddfb5f313
 
-Three chapters, each with the driving action prompt on screen:
-
-1. **Generated vs ground truth** -- held-out clips, each driven by its own recorded keys
-2. **Same first frame, different action prompts** -- identical seed and scene, only the keys differ
-3. **Longer videos** -- generation beyond the training horizon, with chunk seams marked
 
 ## Contents
 
