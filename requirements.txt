@@ -19,3 +19,10 @@ modelscope==1.39.1
 huggingface-hub==0.36.2
 triton==3.6.0
 peft==0.20.0
+# Not in the README's pinned list, but DiffSynth-Studio-h3-v2's
+# diffsynth/core/__init__.py unconditionally imports unified_dataset.py,
+# which imports pandas -- needed even for inference-only use, since Python
+# requires the whole import chain to succeed regardless of what's actually
+# called. No specific version verified compatible; unpinned since nothing
+# else here depends on a particular pandas API.
+pandas
