@@ -1,9 +1,10 @@
 #!/bin/bash
 # Download H3-World's model weights: the MiniMax-H3 backbone (~135 GiB) and
-# the H3-World LoRA checkpoint. Requires env.sh to already be sourced (sets
-# DIFFSYNTH_ROOT/HF_HOME) and the venv from setup_and_run.sh to be active.
+# the H3-World LoRA checkpoint. Auto-sources env.sh (sets DIFFSYNTH_ROOT/
+# HF_HOME) if not already done; still needs the venv from setup_and_run.sh
+# to be active so `python3` resolves to the right interpreter/huggingface_hub.
 #
-#   source env.sh && source .venv/bin/activate && bash download_models.sh
+#   source .venv/bin/activate && bash download_models.sh
 #   HF_TOKEN=hf_xxx bash download_models.sh   # if either HF repo needs auth
 set -euo pipefail
 
@@ -11,8 +12,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
 if [ -z "${DIFFSYNTH_ROOT:-}" ]; then
-  echo "ERROR: DIFFSYNTH_ROOT is not set -- run 'source env.sh' first." >&2
-  exit 1
+  echo "DIFFSYNTH_ROOT not set -- sourcing env.sh..."
+  # shellcheck disable=SC1091
+  source "$REPO_ROOT/env.sh"
 fi
 
 # Backbone download is ~135 GiB; LoRA checkpoint is small (65.6M params,
@@ -27,10 +29,15 @@ if [ "$AVAIL_GB" -lt 160 ]; then
 fi
 echo
 
-echo "Backbone: MiniMax/MiniMax-H3 (~135 GiB) -- this will take a while."
+echo "Backbone: MiniMaxAI/MiniMax-H3 (~135 GiB) -- this will take a while."
+# Real HF org is MiniMaxAI, not MiniMax as the README states (verified via
+# web search -- README's repo ID was stale/wrong, gave a 401/404 on the
+# nonexistent MiniMax/MiniMax-H3). Local directory layout kept as
+# models/MiniMax/MiniMax-H3 regardless -- that's what DiffSynth-Studio's
+# loader expects on disk, unrelated to the remote HF org name.
 python3 - <<PY
 from huggingface_hub import snapshot_download
-snapshot_download("MiniMax/MiniMax-H3", local_dir="${DIFFSYNTH_ROOT}/models/MiniMax/MiniMax-H3")
+snapshot_download("MiniMaxAI/MiniMax-H3", local_dir="${DIFFSYNTH_ROOT}/models/MiniMax/MiniMax-H3")
 PY
 
 echo
