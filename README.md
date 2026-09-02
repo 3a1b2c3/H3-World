@@ -1,4 +1,4 @@
-# Action-Controllable World Model on MiniMax-H3
+# First Interactive World Model on MiniMax-H3
 
 Turn keyboard input into video: the same first frame plus a different key sequence
 should produce a different -- and *correct* -- motion. Built by fine-tuning
