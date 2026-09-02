@@ -17,7 +17,7 @@ gameplay footage.
 
 ## Demo
 
-https://github.com/user-attachments/assets/cc2b1099-cc67-407f-8824-e4cddfb5f313
+https://github.com/user-attachments/assets/1c862995-8809-447e-bade-2c47bfdb2738
 
 
 ## Contents
