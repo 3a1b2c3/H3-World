@@ -1,149 +1,120 @@
-# First Interactive World Model on MiniMax-H3
+# 🎮 H3-World: Turning Language Understanding into World Control
 
 https://github.com/user-attachments/assets/1c862995-8809-447e-bade-2c47bfdb2738
 
-Turn keyboard input into video: the same first frame plus a different key sequence
-should produce a different -- and *correct* -- motion. Built by fine-tuning
-[MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3) on
-[ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h)
-gameplay footage.
+H3-World is the **first interactive world model** built on [MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3). It generates action-controlled video from an initial frame by converting keyboard states into per-latent language instructions and binding each instruction to its corresponding future video latent through directed attention routing. Using 8,000 gameplay clips from [ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h), H3-World learns 65.6M LoRA parameters, only 0.199% of the 33B backbone.
 
-<a href="https://huggingface.co/DANNY621/H3-World-results"><img src="https://img.shields.io/badge/🤗_HuggingFace-Model-ffbd45.svg" alt="HuggingFace Model"></a>
-<a href="https://danzer1xxxxchan.github.io/H3-World"><img src="https://img.shields.io/badge/Web-Project Page-1d72b8.svg" alt="Project Page"></a>
-<a href="https://arxiv.org/abs/2609.01560">
-  <img src="https://img.shields.io/badge/arXiv-H3--World-A42C25.svg" alt="arXiv">
-</a>
+<a href="https://arxiv.org/abs/2609.01560"><img src="https://img.shields.io/badge/arXiv-H3--World-A42C25.svg" alt="arXiv"></a>
+<a href="https://huggingface.co/DANNY621/H3-World"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-ffbd45.svg" alt="Hugging Face model"></a>
+<a href="https://danzer1xxxxchan.github.io/H3-World"><img src="https://img.shields.io/badge/Web-Project%20Page-1d72b8.svg" alt="Project page"></a>
 
-> **H3-World: Turning Language Understanding into World Control**    
-> Danze Chen<sup>12</sup>, Zeqing Wang<sup>12</sup>, Ziyue Lin<sup>3</sup>, [Xingyi Yang](https://adamdad.github.io/)<sup>3</sup> , [Yeying Jin](https://jinyeying.github.io/)<sup>12</sup>  
-> <sup>1</sup> Tencent, <sup>2</sup> National University of Singapore, <sup>3</sup> The Hong Kong Polytechnic University
+> **H3-World: Turning Language Understanding into World Control**<br>
+> Danze Chen<sup>1,2</sup>, Zeqing Wang<sup>1,2</sup>, Ziyue Lin<sup>3</sup>, [Xingyi Yang](https://adamdad.github.io/)<sup>3</sup>, [Yeying Jin](https://jinyeying.github.io/)<sup>1,2</sup><br>
+> <sup>1</sup>Tencent &nbsp; <sup>2</sup>National University of Singapore &nbsp; <sup>3</sup>The Hong Kong Polytechnic University
 
+## ⚙️ Setup
 
-## Contents
-
-- [Installation](#installation)
-- [Quick start](#quick-start)
-- [Training](#training)
-
-## Installation
-
-Tested with CUDA 12.8.
+Tested with Python 3.10 and CUDA 12.8.
 
 ```bash
-# 1. environment
 conda create -n minimax_h3 python=3.10 -y
 conda activate minimax_h3
 pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 
-# 2. framework -- pin the base commit, then apply this repo's patch
+# Use the exact DiffSynth revision and the H3-World attention patch.
 git clone https://github.com/modelscope/DiffSynth-Studio.git DiffSynth-Studio-h3-v2
-git -C DiffSynth-Studio-h3-v2 checkout $(cat code/diffsynth_base_commit.txt)
+git -C DiffSynth-Studio-h3-v2 checkout "$(cat code/diffsynth_base_commit.txt)"
 git -C DiffSynth-Studio-h3-v2 apply ../code/diffsynth_h3_action.patch
 
-# 3. weights (~135 GB) into DiffSynth-Studio-h3-v2/models/
-python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download('MiniMax/MiniMax-H3',
-                  local_dir='DiffSynth-Studio-h3-v2/models/MiniMax/MiniMax-H3')"
-
-# 4. point every cache at this repo instead of the default locations
+# Keep Hugging Face, Torch, and Triton caches inside this repository.
 source env.sh
 ```
 
-`code/diffsynth_h3_action.patch` is the complete framework diff (7 files: the
-directed attention mask, the per-latent text injection, the packed-sequence
-layout, and one training entry point). It also disables `flex_attention`'s
-autotune, because on H200 one of its candidate kernels raises an illegal memory
-access that poisons the whole CUDA context and kills a random rank at step 0 --
-autotune bought nothing here (75.6 vs 76.1 ms/iter against the default heuristic).
+Download the required weights into the following locations:
 
-**Do not `pip install -e` this checkout.** An editable install registers a finder
-that resolves `import diffsynth` back to whatever package it was installed from,
-regardless of `sys.path` order or `PYTHONPATH`. If that finder is active, training
-and inference silently run against the wrong code with no error and a
-normal-looking loss curve -- `code/train.sh` and `code/abot/infer.py` both strip it
-before importing diffsynth and hard-fail if the check doesn't pass, but only for
-imports that go through them.
-
-## Quick start
-
-### Build the dataset
+| Asset | Required for | Target location |
+| --- | --- | --- |
+| [MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3) base weights (about 135 GB) | inference and training | `DiffSynth-Studio-h3-v2/models/MiniMax/MiniMax-H3/` |
+| [H3-World LoRA](https://huggingface.co/DANNY621/H3-World) | inference | `checkpoints/H3-World/step-10000.safetensors` |
+| [ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h) | training only | any local path, passed through `ABOT_SRC_ROOT` |
 
 ```bash
-# cut clips + per-frame actions from the raw episodes
+python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('MiniMax/MiniMax-H3', local_dir='DiffSynth-Studio-h3-v2/models/MiniMax/MiniMax-H3')"
+
+python3 -c "
+from huggingface_hub import hf_hub_download
+hf_hub_download('DANNY621/H3-World', 'step-10000.safetensors', local_dir='checkpoints/H3-World')"
+```
+
+The patch is required for the released checkpoint. Do not install `DiffSynth-Studio-h3-v2` in editable mode; the included training and inference scripts verify that they load the patched checkout.
+
+## 🎬 Inference
+
+The repository includes a held-out ABot test frame at `examples/first_frame.png`. The following fixed configuration generates a 5.2-second forward-motion video:
+
+```bash
+python3 code/abot/infer.py \
+  --checkpoint checkpoints/H3-World/step-10000.safetensors \
+  --first-frame examples/first_frame.png \
+  --scene-prompt "A man in a yellow floral shirt stands in a dim, multi-level concrete parking garage." \
+  --action-preset forward \
+  --seed 2 \
+  --steps 50 \
+  --num-frames 124 \
+  --cfg-scale 1.0 \
+  --out outputs/example_forward.mp4
+```
+
+The included frame is sample `d0b768c6` from the held-out test split. To use a custom image, replace `examples/first_frame.png` and describe its static scene and subject with `--scene-prompt`. Inputs are center-cropped to 832x480 when needed. The built-in presets are `still`, `forward`, `back`, `strafe-left`, `strafe-right`, `tilt-up`, `tilt-down`, `pan-left`, `pan-right`, `pan-left-fast`, and `pan-right-fast`. The full key-to-language mapping is defined in [`code/abot/action_script.py`](code/abot/action_script.py).
+
+## 🏋️ Training
+
+Prepare the 7,872-clip training split, cache its latents, inject the per-latent action instructions, then train LoRA:
+
+```bash
+# 1. Build clips and the fixed train/test split from ABot.
 ABOT_SRC_ROOT=/path/to/ABot-World-Explorer-500h \
   python3 code/abot/build_abot_clips.py --num-clips 8000 --workers 48
-
-# hold out a fixed test split
+ABOT_SRC_ROOT=/path/to/ABot-World-Explorer-500h \
+  python3 code/abot/build_abot_clips.py --verify 8
 python3 code/abot/split_abot_metadata.py \
   --input data/abot_meta_8000.jsonl \
   --train-output data/abot_meta_train_7872.jsonl \
-  --test-output  data/abot_meta_test_128.jsonl \
+  --test-output data/abot_meta_test_128.jsonl \
   --clips-dir data/clips
-```
 
-### Cache latents, then inject the action text
-
-Stage-1 latent caching uses DiffSynth's own dataset builder
-(`examples/minimax_h3/model_training/train_v2.py ... --task sft:data_process`,
-same invocation as training in `code/train.sh` but with that one flag changed).
-Once the cache exists, write the per-latent action sentences into it:
-
-```bash
+# 2. Cache the video, audio, and text latents, then add action text.
+bash code/cache.sh
 python3 code/abot/inject_abot_text.py \
   --meta data/abot_meta_train_7872.jsonl \
   --cache output/minimax_h3_abot/7872-cache \
   --device cuda:0
+
+# 3. Train on four GPUs by default.
+bash code/train.sh
 ```
 
-### Inference
+`code/train.sh` uses rank-32 LoRA on `qkv_proj` and `out_proj` for 20 epochs, saving checkpoints every 2,000 steps. Override the visible devices with `CUDA_VISIBLE_DEVICES=4,5,6,7 bash code/train.sh`.
 
-```bash
-python3 code/abot/infer.py \
-  --checkpoint output/minimax_h3_abot/7872_directed/step-10000.safetensors \
-  --first-frame path/to/first_frame.png \
-  --scene-prompt "The scene is ..." \
-  --action-preset pan-right-fast \
-  --out generated.mp4
-```
+## 🙏 Acknowledgements
 
-`--action-preset` covers the basic single-combination vocabulary (`still`,
-`forward`, `back`, `strafe-left`, `strafe-right`, `tilt-up`, `tilt-down`,
-`pan-left`, `pan-right`, `pan-left-fast`, `pan-right-fast`); the full key ->
-sentence rule table, including compound actions, is in
-[`code/abot/action_script.py`](code/abot/action_script.py).
+- [MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3)
+- [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio)
+- [ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h)
 
-## Training
+## 📚 Citation
 
-```bash
-bash code/train.sh                    # 4 GPUs (0-3) by default
-CUDA_VISIBLE_DEVICES=4,5,6,7 bash code/train.sh
-```
-
-This is the released configuration: 7,872 training clips, rank-32 LoRA on
-`qkv_proj`/`out_proj`, 20 epochs, checkpoints saved every 2,000 steps. Two things
-must both point at the patched framework, or training silently uses a different
-attention mask against the same data: the script `cd`s into
-`DiffSynth-Studio-h3-v2`, and its entry point (`train_v2.py`) strips the
-editable-install finder before importing diffsynth and runs three hard
-preflight checks -- see "Installation" above for why that finder is a problem.
-
-## Acknowledgements
-
-- [MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3) -- the base model
-- [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) -- the training framework
-- [ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h) -- the gameplay data
-
-## 🔗 Citation
-```
+```bibtex
 @misc{chen2026h3worldturninglanguageunderstanding,
-      title={H3-World: Turning Language Understanding into World Control}, 
+      title={H3-World: Turning Language Understanding into World Control},
       author={Danze Chen and Zeqing Wang and Ziyue Lin and Xingyi Yang and Yeying Jin},
       year={2026},
       eprint={2609.01560},
       archivePrefix={arXiv},
       primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2609.01560}, 
+      url={https://arxiv.org/abs/2609.01560},
 }
 ```
