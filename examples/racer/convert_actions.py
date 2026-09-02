@@ -33,12 +33,23 @@ construction (_build_action_block_masks -> create_block_mask) allocates a
 dense [length, length] tensor that scales with sequence length, tried to
 allocate 209.81 GiB for the full clip.
 
-Default here is 175, not the README-matching 124: 0001.json's first real
+Default here is 243, not the README-matching 124: 0001.json's first real
 "turn right" segment is ticks 81-161 (81 ticks) -- 124 frames cuts it off
-after only 43 of those ticks. 175 is the smallest valid (17k+5) value that
-captures the complete first turn. Memory cost of the longer mask is still
-tiny relative to the full-clip OOM (roughly (52/407)^2 of the 209.81 GiB
-that failed, using latent_t as the scaling proxy -- a few GB, not hundreds).
+after only 43 of those ticks; 175 is the smallest valid (17k+5) value that
+captures the complete first turn, and ticks 0-174 were then edited (see
+below) to be "turn right" throughout that window. 243 extends a bit
+further (~10.1s clip) and happens to land exactly at the start of the
+next genuine "turn right" segment in the original recording (243-323),
+so ticks 175-242 are unedited (no-op, as originally recorded) before real
+turning resumes right where this window ends. Memory cost of the longer
+mask is still tiny relative to the full-clip OOM (roughly (72/407)^2 of
+the 209.81 GiB that failed, using latent_t as the scaling proxy -- a few
+GB, not hundreds).
+
+NOTE: 0001.json itself was edited (ticks 0-174's "view" field, originally
+mostly "no-op", changed to "turn right") to make the used window turn
+right throughout instead of only ticks 81-161 -- this script just converts
+whatever's currently in 0001.json, it doesn't know that edit happened.
 
 Run: python3 examples/racer/convert_actions.py [--max-frames N]
 """
@@ -54,9 +65,9 @@ sys.path.insert(0, str(CODE_ABOT))
 import abot_action as A  # noqa: E402
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--max-frames", type=int, default=175,
+ap.add_argument("--max-frames", type=int, default=243,
                 help="cap on num_frames, must be 17k+5 -- see module docstring for why "
-                     "175 (not the full clip, not the README's 124) is the default")
+                     "243 (~10.1s, not the full clip, not the README's 124) is the default")
 args = ap.parse_args()
 if (args.max_frames - 5) % 17:
     ap.error(f"--max-frames must be 17k+5 (124, 243, 481, ...), got {args.max_frames}")
