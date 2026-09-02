@@ -31,8 +31,14 @@ abot_action.py's latent_t_for) -- printed so it can be passed to infer.py's
 1382-frame clip OOMs even on a 249 GiB GPU -- the DiT's action-block-mask
 construction (_build_action_block_masks -> create_block_mask) allocates a
 dense [length, length] tensor that scales with sequence length, tried to
-allocate 209.81 GiB for the full clip. Default here (124) matches the
-README's own standard example, already confirmed to fit.
+allocate 209.81 GiB for the full clip.
+
+Default here is 175, not the README-matching 124: 0001.json's first real
+"turn right" segment is ticks 81-161 (81 ticks) -- 124 frames cuts it off
+after only 43 of those ticks. 175 is the smallest valid (17k+5) value that
+captures the complete first turn. Memory cost of the longer mask is still
+tiny relative to the full-clip OOM (roughly (52/407)^2 of the 209.81 GiB
+that failed, using latent_t as the scaling proxy -- a few GB, not hundreds).
 
 Run: python3 examples/racer/convert_actions.py [--max-frames N]
 """
@@ -48,9 +54,9 @@ sys.path.insert(0, str(CODE_ABOT))
 import abot_action as A  # noqa: E402
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--max-frames", type=int, default=124,
+ap.add_argument("--max-frames", type=int, default=175,
                 help="cap on num_frames, must be 17k+5 -- see module docstring for why "
-                     "this defaults to 124 instead of using the full clip")
+                     "175 (not the full clip, not the README's 124) is the default")
 args = ap.parse_args()
 if (args.max_frames - 5) % 17:
     ap.error(f"--max-frames must be 17k+5 (124, 243, 481, ...), got {args.max_frames}")
