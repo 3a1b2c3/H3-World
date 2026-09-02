@@ -43,8 +43,13 @@ if [ "$SKIP_INSTALL" = "0" ]; then
   source "$REPO_ROOT/.venv/bin/activate"
   pip install --upgrade pip
 
-  echo "Installing torch (cu132 -- README says cu128, using cu132 for this box's CUDA 13.2)..."
-  pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu132
+  echo "Installing torch + torchaudio (cu132 -- README says cu128, using cu132 for this box's CUDA 13.2)..."
+  # torchaudio isn't in the README's install steps at all, but
+  # DiffSynth-Studio-h3-v2's diffsynth/utils/data/audio.py imports it
+  # unconditionally (same transitive-import situation as pandas below) --
+  # installed unpinned from the same index so pip resolves whichever
+  # torchaudio build actually matches torch==2.10.0+cu132.
+  pip install torch==2.10.0 torchaudio --index-url https://download.pytorch.org/whl/cu132
 
   echo "Installing requirements.txt..."
   pip install -r requirements.txt
