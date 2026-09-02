@@ -1,5 +1,7 @@
 # First Interactive World Model on MiniMax-H3
 
+https://github.com/user-attachments/assets/1c862995-8809-447e-bade-2c47bfdb2738
+
 Turn keyboard input into video: the same first frame plus a different key sequence
 should produce a different -- and *correct* -- motion. Built by fine-tuning
 [MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3) on
@@ -12,10 +14,6 @@ gameplay footage.
   <img src="https://img.shields.io/badge/arXiv-H3--World-A42C25.svg" alt="arXiv">
 </a>
 
-
-https://github.com/user-attachments/assets/1c862995-8809-447e-bade-2c47bfdb2738
-
-
 > **H3-World: Turning Language Understanding into World Control**    
 > Danze Chen<sup>12</sup>, Zeqing Wang<sup>12</sup>, Ziyue Lin<sup>3</sup>, [Xingyi Yang](https://adamdad.github.io/)<sup>3</sup> , [Yeying Jin](https://jinyeying.github.io/)<sup>12</sup>  
 > <sup>1</sup> Tencent, <sup>2</sup> National University of Singapore, <sup>3</sup> The Hong Kong Polytechnic University
@@ -23,94 +21,9 @@ https://github.com/user-attachments/assets/1c862995-8809-447e-bade-2c47bfdb2738
 
 ## Contents
 
-- [How it works](#how-it-works)
-- [Results](#results)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Training](#training)
-
-## How it works
-
-### Keys -> sentence -> sequence
-
-Each clip is 124 frames at 24 fps (5.2 s). The video VAE compresses it to **37
-latent frames**, so the action track is pooled into 37 steps and each step gets one
-sentence from a fixed template:
-
-```
-the man <how he moves>, camera <how the view moves>
-```
-
-Both slots are a **pure function of 9 bits** -- the 8 recorded keys `W A S D I J K L`
-plus one synthesized `F` (fast) bit. The action dictionary is 9 character clauses x
-16 camera clauses = 144 structurally valid combinations, of which 135 are reachable
-and 83 are actually observed across the 7,872-clip training set. Because the
-mapping is a pure function, training and inference run the exact same code path;
-there is no learned representation to keep in sync.
-
-The 9th bit matters: direction is readable from the keys, **speed is not**. On
-steps where `J` is held, `slowly`/`sharply` split close to a coin flip. So `F` is
-synthesized from the camera rotation rate recovered from COLMAP pose estimates on
-the raw episode -- it's the one channel that genuinely adds information beyond the
-raw 8 keys.
-
-### Where the sentences go, and why a directed mask
-
-H3 has no cross-attention; its text already lives in the same self-attention
-sequence as the video. So the 37 sentences are simply more text rows, placed at a
-fixed offset before their bound video frame.
-
-Self-attention is permutation-equivariant, so position alone cannot tell the model
-which sentence belongs to which frame. A mask does. The mask here is **directed**,
-not symmetric: annotation row *k* can be *read by* video frame *k* and by itself,
-but *cannot itself read* any other annotation row. This closes a bypass that a
-symmetric mask leaves open -- with a symmetric mask, annotation *j* can flow into
-annotation *k* through their mutual visibility, so video frame *k* reading
-annotation *k* ends up reading annotation *j* too, and the guarantee that action
-*k* only reaches frame *k* breaks. Everything else -- video<->video, annotation<->
-first-frame condition, annotation<->itself -- is untouched, so removing the
-annotation rows recovers the original model exactly.
-
-Only a LoRA on `qkv_proj`/`out_proj` is trained: rank 32 across the 50 DiT blocks
-plus 2 token-refiner layers (52 layers x 2 modules = 104 modules, 208 tensors,
-65.6M parameters, 0.198% of the 33.1B DiT). The condition path itself adds no new
-weights.
-
-### Why 37 latents, and why 124 frames
-
-The video VAE is **causal in time** with 4x temporal compression, and encodes in
-independent 17-frame clips. That gives the frame grouping `1,4,4,4,4` per clip:
-
-```
-124 frames -> 8 clips x 17 (padded from 122)
-           -> each clip encodes independently to 5 latents = 40
-           -> token_drop removes the last 3          -> 37 latents
-```
-
-Hence `num_frames` must be `17k + 5`: 124 (5.2 s), 243 (10.1 s), 481 (20.0 s).
-
-## Results
-
-**The directed mask and adaptation are both necessary, and the mask alone isn't
-enough without adaptation.** The test below uses a single instruction whose meaning
-changes mid-clip -- the camera pans left for the first 15 latents, then reverses to
-pan right for the remaining 22 -- so a correct response has to bind each half of
-the instruction to the right half of the video, which a single global sentence
-cannot express positionally. Response is dense optical flow (Farneback), summed
-separately before and after the switch; positive values mean the camera pans left.
-
-| Condition | Before switch (want >0) | After switch (want <0) |
-|---|---:|---:|
-| Base H3 + one global instruction, no LoRA | +0.0 | -17.3 |
-| Base H3 + per-latent prompts, zero-initialized LoRA | -0.1 | 0.0 |
-| **This model** | **+52.7** | **-106.0** |
-
-The zero-LoRA per-latent row shows the base model does not act on latent-aligned
-sentences in this input format at all (mean absolute flow 0.003, the clip is
-essentially frozen), even though it *does* respond to the same instruction phrased
-as one global sentence. Training the LoRA restores directional control and gives
-roughly 5x the response magnitude of the global-prompt baseline. Reversing the
-instruction order (pan right, then left) gives the same pattern.
 
 ## Installation
 
