@@ -40,7 +40,6 @@ Download the required weights into the following locations:
 | [H3-World LoRA](https://huggingface.co/DANNY621/H3-World) | inference | `checkpoints/H3-World/step-10000.safetensors` |
 | [ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h) | training only | any local path, passed through `ABOT_SRC_ROOT` |
 
-
 ```bash
 python3 -c "
 from huggingface_hub import snapshot_download
@@ -52,11 +51,16 @@ snapshot_download(
 
 python3 -c "
 from huggingface_hub import hf_hub_download
-hf_hub_download('DANNY621/H3-World', 'step-10000.safetensors', local_dir='checkpoints/H3-World')"
+hf_hub_download(
+    'DANNY621/H3-World',
+    'step-10000.safetensors',
+    local_dir='checkpoints/H3-World'
+)"
 ```
 
+H3-World uses the original `FL2VA` checkpoint layout released by MiniMax, rather than the root-level Diffusers-format weights. No weight conversion or key remapping is required.
+
 The patch is required for the released checkpoint. Do not install `DiffSynth-Studio-h3-v2` in editable mode; the included training and inference scripts verify that they load the patched checkout.
-H3-World uses the original `FL2VA` checkpoint layout released by MiniMax, rather than the repository-level Diffusers-format weights. No weight conversion or key remapping is required.
 
 ## 🎬 Inference
 
