@@ -1,6 +1,6 @@
 # H3-World: Turning Language Understanding into World Control
 
-H3-World is the **first interactive world model** built on [MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3). It generates action-controlled video from an initial frame by converting keyboard states into per-latent language instructions and binding each instruction to its corresponding future video latent through directed attention routing. Using 8,000 gameplay clips from [ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h), H3-World learns 65.6M LoRA parameters, only 0.199% of the 33B backbone.
+H3-World is the **first interactive world model** built on [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3). It generates action-controlled video from an initial frame by converting keyboard states into per-latent language instructions and binding each instruction to its corresponding future video latent through directed attention routing. Using 8,000 gameplay clips from [ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h), H3-World learns 65.6M LoRA parameters, only 0.199% of the 33B backbone.
 
 <a href="https://arxiv.org/abs/2609.01560"><img src="https://img.shields.io/badge/arXiv-H3--World-A42C25.svg" alt="arXiv"></a>
 <a href="https://huggingface.co/DANNY621/H3-World"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-ffbd45.svg" alt="Hugging Face model"></a>
@@ -36,14 +36,19 @@ Download the required weights into the following locations:
 
 | Asset | Required for | Target location |
 | --- | --- | --- |
-| [MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3) base weights (about 135 GB) | inference and training | `DiffSynth-Studio-h3-v2/models/MiniMax/MiniMax-H3/` |
+| [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) FL2VA base weights | inference and training | `DiffSynth-Studio-h3-v2/models/MiniMax/MiniMax-H3/` |
 | [H3-World LoRA](https://huggingface.co/DANNY621/H3-World) | inference | `checkpoints/H3-World/step-10000.safetensors` |
 | [ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h) | training only | any local path, passed through `ABOT_SRC_ROOT` |
+
 
 ```bash
 python3 -c "
 from huggingface_hub import snapshot_download
-snapshot_download('MiniMax/MiniMax-H3', local_dir='DiffSynth-Studio-h3-v2/models/MiniMax/MiniMax-H3')"
+snapshot_download(
+    'MiniMaxAI/MiniMax-H3',
+    allow_patterns=['model_index.json', 'FL2VA/*'],
+    local_dir='DiffSynth-Studio-h3-v2/models/MiniMax/MiniMax-H3'
+)"
 
 python3 -c "
 from huggingface_hub import hf_hub_download
@@ -51,6 +56,7 @@ hf_hub_download('DANNY621/H3-World', 'step-10000.safetensors', local_dir='checkp
 ```
 
 The patch is required for the released checkpoint. Do not install `DiffSynth-Studio-h3-v2` in editable mode; the included training and inference scripts verify that they load the patched checkout.
+H3-World uses the original `FL2VA` checkpoint layout released by MiniMax, rather than the repository-level Diffusers-format weights. No weight conversion or key remapping is required.
 
 ## 🎬 Inference
 
@@ -102,7 +108,7 @@ bash code/train.sh
 
 ## 🙏 Acknowledgements
 
-- [MiniMax-H3](https://huggingface.co/MiniMax/MiniMax-H3)
+- [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3)
 - [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio)
 - [ABot-World-Explorer-500h](https://huggingface.co/datasets/acvlab/ABot-World-Explorer-500h)
 
