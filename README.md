@@ -58,7 +58,7 @@ hf_hub_download(
 )"
 ```
 
-H3-World uses the original `FL2VA` checkpoint layout released by MiniMax, rather than the root-level Diffusers-format weights. No weight conversion or key remapping is required.
+H3-World uses the original `FL2VA` checkpoint layout released by MiniMax, rather than the root-level Diffusers checkpoint. No weight conversion or key remapping is required.
 
 The patch is required for the released checkpoint. Do not install `DiffSynth-Studio-h3-v2` in editable mode; the included training and inference scripts verify that they load the patched checkout.
 
