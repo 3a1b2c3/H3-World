@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -153,6 +154,15 @@ def main() -> None:
                          "sequence instead of one constant preset -- see "
                          "examples/racer/convert_actions.py for how to build one. "
                          "--num-frames must match the matrix's first dimension exactly.")
+    ap.add_argument("--event", action="append", default=[], metavar="LATENT_IDX:TEXT",
+                    help="override the per-latent action clause at LATENT_IDX with a custom "
+                         "scripted event sentence, e.g. --event 20:'the buggy crashes into the "
+                         "fence and tips over'. Repeatable. This replaces that latent's "
+                         "auto-generated key-based clause entirely (not appended to it) -- the "
+                         "model's action_script is a genuinely per-latent-varying text list "
+                         "(see infer.py's pipe() call), so this is real time-varying prompting, "
+                         "not a hack. LATENT_IDX is a latent-token index (0..latent_t-1, "
+                         "abot_action.latent_t_for(num_frames) total), not a video frame index.")
     ap.add_argument("--num-frames", type=int, default=NUM_FRAMES, help="must be 17k+5")
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--seed", type=int, default=0)
@@ -191,6 +201,19 @@ def main() -> None:
         print(f"action: {args.action_preset}  ({keys9[0].tolist()})")
         print(f"first latent's sentence: {script[0]}")
 
+    for spec in args.event:
+        if ":" not in spec:
+            ap.error(f"--event must be LATENT_IDX:TEXT, got {spec!r}")
+        idx_str, text = spec.split(":", 1)
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            ap.error(f"--event's LATENT_IDX must be an int, got {idx_str!r} in {spec!r}")
+        if not 0 <= idx < latent_t:
+            ap.error(f"--event LATENT_IDX {idx} out of range [0, {latent_t}) for --num-frames {args.num_frames}")
+        print(f"event override: latent {idx}: {script[idx]!r} -> {text!r}")
+        script[idx] = text
+
     lora_state = load_checkpoint_lora(args.checkpoint)
     lora_pairs = sum(1 for k in lora_state if ".lora_A." in k)
     pipe = load_pipeline(args.device)
@@ -202,6 +225,7 @@ def main() -> None:
     print(f"loaded {lora_pairs} LoRA pairs from {args.checkpoint.name}")
 
     first_frame = load_first_frame(args.first_frame)
+    gen_start = time.perf_counter()
     video, audio = pipe(
         prompt=args.scene_prompt,
         negative_prompt=" ",
@@ -217,6 +241,11 @@ def main() -> None:
         # every clause stationary. This way cfg_scale amplifies the
         # action-induced difference, not generic prompt adherence.
         negative_action_script=S.null_script(latent_t),
+    )
+    gen_elapsed = time.perf_counter() - gen_start
+    print(
+        f"generation: {args.num_frames} frames in {gen_elapsed:.2f}s "
+        f"({args.num_frames / gen_elapsed:.3f} fps, {gen_elapsed / args.steps:.3f} s/step)"
     )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
