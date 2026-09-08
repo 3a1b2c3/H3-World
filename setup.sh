@@ -41,6 +41,27 @@ echo "Installing torch (cu132, unpinned)..."
 # CUDA enabled" at generation time, not at install time.
 pip install torch --index-url https://download.pytorch.org/whl/cu132 --force-reinstall
 
+# Checked here rather than left to surface at generation time. Two distinct
+# failures hide behind a successful-looking install: a CPU-only wheel (the
+# silent fallback described above), and a CUDA wheel whose local version tag
+# is not the cu132 that was asked for -- the index has served 2.11.0+cu130
+# for a bare `torch` request while resolving 2.14.0+cu132 when torchvision
+# and torchaudio are requested alongside it. The second still works, since
+# CUDA minor versions are forward compatible, so it warns rather than fails.
+python - <<'PY'
+import sys
+import torch
+
+build = torch.__version__
+print(f"      torch {build} cuda={torch.version.cuda} available={torch.cuda.is_available()}")
+if not torch.cuda.is_available():
+    sys.exit("ERROR: torch cannot see the GPU -- a CPU-only wheel was installed, "
+             "or the driver predates it. Re-run with --force-reinstall.")
+if "+cu132" not in build:
+    print(f"      WARNING: expected a +cu132 build, got {build}. This works on a 13.x")
+    print( "               driver, but is not what the cu132 index was asked for.")
+PY
+
 echo "Installing torchvision + torchaudio (CPU-only)..."
 # Neither is in the README's install steps at all, but
 # DiffSynth-Studio-h3-v2 imports torchaudio unconditionally (see
