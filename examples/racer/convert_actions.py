@@ -79,7 +79,7 @@ if (args.max_frames - 5) % 17:
 
 racer_dir = Path(__file__).parent
 in_path = racer_dir / args.actions_file
-actions = json.loads(in_path.read_text())
+actions = json.loads(in_path.read_text(encoding="utf-8-sig"))
 
 # Largest num_frames <= min(len(actions), args.max_frames) satisfying (n - 5) % 17 == 0.
 n = min(len(actions), args.max_frames)
