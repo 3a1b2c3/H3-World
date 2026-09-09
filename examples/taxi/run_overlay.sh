@@ -14,6 +14,12 @@ TAXI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$TAXI_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Matches README.md's Inference section; override via env if your checkpoint
+# or first-frame image live elsewhere.
+CHECKPOINT="${H3WORLD_CHECKPOINT:-checkpoints/H3-World/step-10000.safetensors}"
+FIRST_FRAME="${H3WORLD_FIRST_FRAME:-examples/taxi/taxi.png}"
+SCENE_PROMPT="$(cat examples/taxi/prompt.txt)"
+
 if [[ "$STEM" == "0001" ]]; then
   ACTIONS_NPY="examples/taxi/actions.npy"
 else
@@ -29,7 +35,13 @@ VIDEO_OUT="outputs/taxi_${STEM}.mp4"
 OVERLAY_OUT="outputs/taxi_${STEM}_overlay.mp4"
 
 echo "== Running inference ($NUM_FRAMES frames) =="
-python3 code/abot/infer.py --action-file "$ACTIONS_NPY" --num-frames "$NUM_FRAMES" --out "$VIDEO_OUT"
+python3 code/abot/infer.py \
+  --checkpoint "$CHECKPOINT" \
+  --first-frame "$FIRST_FRAME" \
+  --scene-prompt "$SCENE_PROMPT" \
+  --action-file "$ACTIONS_NPY" \
+  --num-frames "$NUM_FRAMES" \
+  --out "$VIDEO_OUT"
 
 echo "== Burning key overlay =="
 python3 examples/overlay_keys.py --video "$VIDEO_OUT" --actions "$ACTIONS_NPY" --out "$OVERLAY_OUT"
