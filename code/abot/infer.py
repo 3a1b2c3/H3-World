@@ -163,6 +163,12 @@ def main() -> None:
                          "(see infer.py's pipe() call), so this is real time-varying prompting, "
                          "not a hack. LATENT_IDX is a latent-token index (0..latent_t-1, "
                          "abot_action.latent_t_for(num_frames) total), not a video frame index.")
+    ap.add_argument("--subject", choices=("man", "car"), default="man",
+                    help="noun used in the auto-generated action clauses (default: man, "
+                         "matches the trained vocabulary). 'car' is out-of-distribution -- "
+                         "see action_script.py's SUBJECT_ANCHOR docstring -- but matches "
+                         "driving scenes like examples/taxi and examples/racer better than "
+                         "the default 'the man ...' phrasing.")
     ap.add_argument("--num-frames", type=int, default=NUM_FRAMES, help="must be 17k+5")
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--seed", type=int, default=0)
@@ -190,14 +196,14 @@ def main() -> None:
                       f"(abot_action.ACTION_DIM: {A.ACTION_COLS})")
         pooled = A.bin_to_latent(raw, latent_t)
         keys9 = S.keys9(pooled)
-        script = S.annotate_from_keys9(keys9)
+        script = S.annotate_from_keys9(keys9, subject=args.subject)
         print(f"action: --action-file {args.action_file}  ({keys9[0].tolist()})")
         print(f"first latent's sentence: {script[0]}")
     else:
         keys9 = np.zeros((latent_t, len(S.KEYS9)), dtype=np.int64)
         for key in ACTION_PRESETS[args.action_preset]:
             keys9[:, S.KEYS9.index(key)] = 1
-        script = S.annotate_from_keys9(keys9)
+        script = S.annotate_from_keys9(keys9, subject=args.subject)
         print(f"action: {args.action_preset}  ({keys9[0].tolist()})")
         print(f"first latent's sentence: {script[0]}")
 
@@ -240,7 +246,7 @@ def main() -> None:
         # The "zero action reference" negative prompt: same sentence shape,
         # every clause stationary. This way cfg_scale amplifies the
         # action-induced difference, not generic prompt adherence.
-        negative_action_script=S.null_script(latent_t),
+        negative_action_script=S.null_script(latent_t, subject=args.subject),
     )
     gen_elapsed = time.perf_counter() - gen_start
     print(

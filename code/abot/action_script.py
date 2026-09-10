@@ -38,23 +38,41 @@ import numpy as np
 
 import abot_action as A
 
-# Global subject anchor, so "the man" in the per-frame clauses has an
-# antecedent. What he actually looks like is carried by the <Picture 1>
+# Global subject anchor, so "the man"/"the car" in the per-frame clauses has
+# an antecedent. What it actually looks like is carried by the <Picture 1>
 # visual token in the first frame; this string only needs to give the text
 # a stable referent.
-SUBJECT_ANCHOR = "A third-person view of a man."
+#
+# "car" is not part of the trained vocabulary -- the LoRA only ever saw "the
+# man ..." clauses (ABot-World-Explorer is all walking-human footage). Using
+# subject="car" is out-of-distribution for the action clauses; it exists so
+# the taxi/racer examples' text at least matches what's on screen instead of
+# describing a man for a driving scene, not because the model was trained on
+# it.
+SUBJECT_ANCHOR = {
+    "man": "A third-person view of a man.",
+    "car": "A third-person driving-game view of a car.",
+}
 
 # Motion clauses. Concatenated in a fixed W/S/A/D order so the same key
 # combination always produces the same string -- required for per-sentence
 # encoding plus a dedup dictionary to work.
 MOTION = {
-    "W": "walks forward",
-    "S": "walks backward",
-    "A": "strafes left",
-    "D": "strafes right",
+    "man": {
+        "W": "walks forward",
+        "S": "walks backward",
+        "A": "strafes left",
+        "D": "strafes right",
+    },
+    "car": {
+        "W": "drives forward",
+        "S": "drives backward",
+        "A": "steers left",
+        "D": "steers right",
+    },
 }
 MOTION_ORDER = ("W", "S", "A", "D")
-MOTION_IDLE = "stands still"
+MOTION_IDLE = {"man": "stands still", "car": "idles"}
 
 # Camera clause thresholds. Three bands instead of a continuous value,
 # because language can't express a continuous quantity -- "pans left by
@@ -157,10 +175,10 @@ def _purify(on: dict[str, bool], pairs) -> None:
             on[a] = on[b] = False
 
 
-def _motion_clause(on: dict[str, bool]) -> str:
+def _motion_clause(on: dict[str, bool], subject: str) -> str:
     _purify(on, (("W", "S"), ("A", "D")))
-    words = [MOTION[name] for name in MOTION_ORDER if on[name]]
-    return " and ".join(words) if words else MOTION_IDLE
+    words = [MOTION[subject][name] for name in MOTION_ORDER if on[name]]
+    return " and ".join(words) if words else MOTION_IDLE[subject]
 
 
 def _camera_clause(on: dict[str, bool], moving: bool) -> str:
@@ -177,7 +195,7 @@ def _camera_clause(on: dict[str, bool], moving: bool) -> str:
     return CAMERA_FOLLOW if moving else CAMERA_IDLE
 
 
-def annotate_from_keys9(k9: np.ndarray) -> list[str]:
+def annotate_from_keys9(k9: np.ndarray, subject: str = "man") -> list[str]:
     """**The annotation is a pure function of these 9 bits** -- training and
     inference therefore run through exactly the same code path.
 
@@ -185,22 +203,28 @@ def annotate_from_keys9(k9: np.ndarray) -> list[str]:
     the camera itself is translating, 1.7% of steps): it can't be derived
     from the keys by definition, and inference has no way to produce it
     either, so it folds into "holds steady".
+
+    subject: "man" (default, matches the trained vocabulary) or "car"
+    (out-of-distribution -- see SUBJECT_ANCHOR's docstring).
     """
+    if subject not in MOTION:
+        raise ValueError(f"unknown subject {subject!r}, expected one of {sorted(MOTION)}")
     if k9.ndim != 2 or k9.shape[1] != len(KEYS9):
         raise ValueError(f"expected [latent_t, {len(KEYS9)}], got {list(k9.shape)}")
+    noun = "the man" if subject == "man" else "the car"
     out = []
     for row in k9:
         on = {c: bool(row[i] > 0) for i, c in enumerate(KEYS9)}
-        motion = _motion_clause(dict(on))
-        camera = _camera_clause(dict(on), motion != MOTION_IDLE)
-        out.append(f"the man {motion}, camera {camera}")
+        motion = _motion_clause(dict(on), subject)
+        camera = _camera_clause(dict(on), motion != MOTION_IDLE[subject])
+        out.append(f"{noun} {motion}, camera {camera}")
     return out
 
 
-def annotate(pooled: np.ndarray, **_ignored) -> list[str]:
+def annotate(pooled: np.ndarray, **kw) -> list[str]:
     """[latent_t, 17] -> list of annotation strings. Derives the 9-bit
     action first, then runs the pure function above."""
-    return annotate_from_keys9(keys9(pooled))
+    return annotate_from_keys9(keys9(pooled), **kw)
 
 
 def script_for_clip(action_path: Path, num_frames: int = 124, latent_t: int = 37,
@@ -209,14 +233,15 @@ def script_for_clip(action_path: Path, num_frames: int = 124, latent_t: int = 37
     return annotate(A.bin_to_latent(matrix, latent_t), **kw)
 
 
-def null_script(latent_t: int = 37) -> list[str]:
+def null_script(latent_t: int = 37, subject: str = "man") -> list[str]:
     """The CFG "zero action reference" negative prompt: the same sentence
     shape, with every action set to stationary.
 
     This way, cfg_scale amplifies just the action-induced difference,
     rather than generic prompt adherence.
     """
-    return [f"the man {MOTION_IDLE}, camera {CAMERA_IDLE}"] * latent_t
+    noun = "the man" if subject == "man" else "the car"
+    return [f"{noun} {MOTION_IDLE[subject]}, camera {CAMERA_IDLE}"] * latent_t
 
 
 # --------------------------------------------------------------------------- #
@@ -230,7 +255,7 @@ def _self_test() -> None:
     scripts = [script_for_clip(clips / r["action"]) for r in rows]
 
     print("== single-clip sample ==")
-    print(f"subject anchor: {SUBJECT_ANCHOR}")
+    print(f"subject anchor: {SUBJECT_ANCHOR['man']}")
     for s in scripts[0][:6]:
         print(f"  {s}")
     print("  ...")
@@ -247,13 +272,13 @@ def _self_test() -> None:
     for s, n in c.most_common(8):
         print(f"  {n / len(flat):.3f}  {s}")
 
-    idle = sum(1 for s in flat if f"{MOTION_IDLE}, camera {CAMERA_IDLE}" in s)
+    idle = sum(1 for s in flat if f"{MOTION_IDLE['man']}, camera {CAMERA_IDLE}" in s)
     print(f"\n== coverage ==")
     print(f"  fully stationary steps (no motion, no camera): {idle / len(flat):.3f}")
     print(f"  steps with camera motion:                      "
           f"{sum(1 for s in flat if CAMERA_IDLE not in s) / len(flat):.3f}")
     print(f"  steps with character motion:                   "
-          f"{sum(1 for s in flat if MOTION_IDLE not in s) / len(flat):.3f}")
+          f"{sum(1 for s in flat if MOTION_IDLE['man'] not in s) / len(flat):.3f}")
 
     lens = [len(s) for s in vocab]
     print(f"\n  annotation length {min(lens)}-{max(lens)} characters")

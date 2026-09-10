@@ -41,6 +41,7 @@ python3 code/abot/infer.py \
   --scene-prompt "$SCENE_PROMPT" \
   --action-file "$ACTIONS_NPY" \
   --num-frames "$NUM_FRAMES" \
+  --subject car \
   --out "$VIDEO_OUT"
 
 echo "== Burning key overlay =="
